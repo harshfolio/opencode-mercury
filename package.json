@@ -1,0 +1,39 @@
+{
+  "name": "@harshfolio/opencode-mercury",
+  "version": "0.1.0",
+  "description": "Private OpenCode plugin that bootstraps a portable PKM vault and hot-memory layer for any user.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/harshfolio/opencode-mercury.git"
+  },
+  "homepage": "https://github.com/harshfolio/opencode-mercury",
+  "bugs": {
+    "url": "https://github.com/harshfolio/opencode-mercury/issues"
+  },
+  "exports": {
+    "./server": "./dist/server.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "plugin",
+    "pkm",
+    "memory",
+    "vault"
+  ],
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.4.3"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "restricted"
+  },
+  "scripts": {
+    "check": "node --check dist/server.js"
+  }
+}
