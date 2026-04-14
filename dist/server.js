@@ -444,8 +444,11 @@ async function materializePaths(input, config = {}) {
     || DEFAULT_MEMORY_ROOT;
   const vaultPath = firstDefinedPath(config.vaultPath, persisted.vaultPath, process.env.OPENCODE_PKM_VAULT_PATH)
     || DEFAULT_VAULT_ROOT;
-  const opencodeDbPath = firstDefinedPath(config.opencodeDbPath, persisted.opencodeDbPath, process.env.OPENCODE_PKM_DB_PATH)
-    || await firstExistingPath(DEFAULT_DB_CANDIDATES)
+  const explicitDbPath = firstDefinedPath(config.opencodeDbPath, process.env.OPENCODE_PKM_DB_PATH);
+  const rememberedDbPath = firstDefinedPath(persisted.opencodeDbPath);
+  const opencodeDbPath = explicitDbPath
+    || await firstExistingPath([rememberedDbPath, ...DEFAULT_DB_CANDIDATES])
+    || rememberedDbPath
     || DEFAULT_DB_CANDIDATES[0];
 
   return {
