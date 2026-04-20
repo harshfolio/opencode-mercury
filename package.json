@@ -1,12 +1,14 @@
 {
   "name": "@harshfolio/opencode-mercury",
   "version": "0.2.1",
-  "description": "Private OpenCode plugin that bootstraps a portable PKM vault, imports knowledge, and maintains hot memory for any user.",
+  "description": "Persistent local memory for OpenCode that keeps compact context, session continuity, and vault knowledge current.",
   "type": "module",
   "license": "MIT",
+  "author": "Harsh Sharma",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/harshfolio/opencode-mercury.git"
+    "url": "git+https://github.com/harshfolio/opencode-mercury.git",
+    "directory": "."
   },
   "homepage": "https://github.com/harshfolio/opencode-mercury",
   "bugs": {
@@ -29,14 +31,17 @@
     "plugin",
     "pkm",
     "memory",
-    "vault"
+    "vault",
+    "context",
+    "knowledge-management",
+    "ai-agent"
   ],
   "dependencies": {
     "@opencode-ai/plugin": "^1.4.3"
   },
   "publishConfig": {
     "registry": "https://npm.pkg.github.com",
-    "access": "restricted"
+    "access": "public"
   },
   "scripts": {
     "build": "node scripts/build.mjs",
