@@ -58,16 +58,17 @@ Then run:
 - `pkm_status` to confirm health
 - `pkm_refresh` if you want an immediate full rebuild
 
-### Option 2: Install from GitHub Packages
+### Option 2: Install as a package
 
-Mercury also ships as `@harshfolio/opencode-mercury` through GitHub Packages.
+Mercury is now configured for a **public npm release path**.
 
-That path requires npm auth for `https://npm.pkg.github.com`.
+Once the public npm publish is completed, the install flow becomes:
 
-```ini
-@harshfolio:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=YOUR_GITHUB_TOKEN
+```bash
+npm install -g @harshfolio/opencode-mercury
 ```
+
+Until that publish is completed, the source install above remains the reliable path.
 
 ## Runtime requirements
 
@@ -214,6 +215,7 @@ Mercury currently favors correctness over aggressive incremental indexing. The c
 ## Public launch assets
 
 - `docs/awesome-opencode-plugin.yaml` contains a ready-to-submit awesome-opencode entry draft
+- `docs/opencode-cafe-submission.md` contains ready-to-paste marketplace copy
 - GitHub Releases are used for versioned public release notes
 
 ## License
