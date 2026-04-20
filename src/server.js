@@ -1127,20 +1127,39 @@ function queryAll(db, sql, ...params) {
   return db.driver.queryAll(db.handle, sql, ...params);
 }
 
+function messageText(db, messageID) {
+  const parts = queryAll(db, "SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC", messageID);
+  return parts
+    .map((partRow) => safeJsonParse(partRow.data, null))
+    .filter((part) => part && part.type === "text")
+    .map((part) => stripFences(part.text || ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
 function firstUserPrompt(db, sessionID) {
   const messages = queryAll(db, "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC", sessionID);
   for (const row of messages) {
     const message = safeJsonParse(row.data, null);
     if (!message || message.role !== "user") continue;
-    const parts = queryAll(db, "SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC", row.id);
-    for (const partRow of parts) {
-      const part = safeJsonParse(partRow.data, null);
-      if (!part || part.type !== "text") continue;
-      const text = stripFences(part.text || "");
-      if (!text) continue;
-      const firstLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-      if (firstLine) return truncate(firstLine, 120);
-    }
+    const text = messageText(db, row.id);
+    if (!text) continue;
+    const firstLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    if (firstLine) return truncate(firstLine, 120);
+  }
+  return "";
+}
+
+function firstAssistantOutcome(db, sessionID, fallback) {
+  const messages = queryAll(db, "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC", sessionID);
+  for (const row of messages) {
+    const message = safeJsonParse(row.data, null);
+    if (!message || message.role !== "assistant") continue;
+    const text = messageText(db, row.id);
+    if (!text || isNoise(text)) continue;
+    const summary = extractNoteSummary(text, fallback);
+    if (summary) return truncate(summary, 180);
   }
   return "";
 }
@@ -1156,6 +1175,7 @@ async function buildSessionSummariesFromDb(paths, limit = MAX_RECENT_SESSIONS) {
       const project = path.basename(row.directory || "global") || "global";
       let title = row.title || promptExcerpt || project;
       if (String(title).startsWith("New session -") && promptExcerpt) title = promptExcerpt;
+      const summary = firstAssistantOutcome(db, row.id, title) || promptExcerpt || title;
       return {
         session_id: row.id,
         updated: isoFromMs(row.time_updated),
@@ -1164,6 +1184,7 @@ async function buildSessionSummariesFromDb(paths, limit = MAX_RECENT_SESSIONS) {
         directory: row.directory || "",
         title: truncate(title, 100),
         prompt_excerpt: promptExcerpt,
+        summary: truncate(summary, 180),
       };
     });
   } finally {
@@ -1244,6 +1265,7 @@ async function updateSessionState(paths, state, sessionInfo) {
     directory: sessionInfo.directory || "",
     title: summarizePrompt(text, path.basename(sessionInfo.directory || "session")),
     prompt_excerpt: summarizePrompt(text, path.basename(sessionInfo.directory || "session")),
+    summary: summarizePrompt(text, path.basename(sessionInfo.directory || "session")),
   };
   state.sessions[sessionID] = { title: entry.title, updated: entry.updated };
   await appendLedgerEntry(paths, entry);
@@ -1371,21 +1393,21 @@ async function buildDerivedMemory(paths) {
   const existing = await readExistingActiveContext(paths);
   const priorities = await readCurrentPriorities(paths);
   const vaultFocus = await readVaultFocus(paths);
-  const ledger = (await parseLedger(paths)).filter((entry) => !isNoise(`${entry.title || ""} ${entry.prompt_excerpt || ""} ${entry.directory || ""}`));
+  const ledger = (await parseLedger(paths)).filter((entry) => !isNoise(`${entry.title || ""} ${entry.summary || ""} ${entry.prompt_excerpt || ""} ${entry.directory || ""}`));
   const recentSessions = ledger.slice(0, 5);
   const knowledgeIndex = await readKnowledgeIndex(paths);
   const recentKnowledge = recentKnowledgeEntries(knowledgeIndex);
 
   const focusLines = mergeUniqueLines(
     vaultFocus,
-    recentSessions.slice(0, 3).map((entry) => `- Recent work: ${entry.title} (${entry.project})`),
+    recentSessions.slice(0, 3).map((entry) => `- Recent work: ${entry.summary || entry.title} (${entry.project})`),
     recentKnowledge.slice(0, 2).map((entry) => `- Recent knowledge: ${entry.title} — ${entry.summary}`),
   );
 
   const workstreams = inferWorkstreams([
     ...recentSessions.map((entry) => ({
-      text: `${entry.title || ""} ${entry.prompt_excerpt || ""} ${entry.project || ""} ${entry.directory || ""}`,
-      evidence: entry.title || entry.prompt_excerpt || entry.project || "Recent session",
+      text: `${entry.title || ""} ${entry.summary || ""} ${entry.prompt_excerpt || ""} ${entry.project || ""} ${entry.directory || ""}`,
+      evidence: entry.summary || entry.title || entry.prompt_excerpt || entry.project || "Recent session",
       updatedMs: Number(entry.updated_ms || Date.parse(entry.updated || "") || 0),
     })),
     ...recentKnowledge.map((entry) => ({
@@ -1396,7 +1418,7 @@ async function buildDerivedMemory(paths) {
   ]);
 
   const recentSessionLines = recentSessions.length
-    ? recentSessions.map((entry) => `- ${formatRecentTimestamp(Number(entry.updated_ms || Date.parse(entry.updated || "") || 0))} — ${entry.project} — ${entry.title}`)
+    ? recentSessions.map((entry) => `- ${formatRecentTimestamp(Number(entry.updated_ms || Date.parse(entry.updated || "") || 0))} — ${entry.project} — ${entry.summary || entry.title}`)
     : ["- No recent sessions captured yet"];
 
   const recentKnowledgeLines = recentKnowledge.length
