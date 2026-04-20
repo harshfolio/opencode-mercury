@@ -1693,6 +1693,34 @@ function attachWatch(controller, target, options, reason) {
   }
 }
 
+async function shutdownMaintenanceController(paths) {
+  const key = maintenanceControllerKey(paths);
+  const controller = maintenanceControllers.get(key);
+  if (!controller) return;
+
+  controller.shutdown = true;
+
+  if (controller.scheduledTimer) {
+    clearTimeout(controller.scheduledTimer);
+    controller.scheduledTimer = null;
+  }
+
+  if (controller.intervalHandle) {
+    clearInterval(controller.intervalHandle);
+    controller.intervalHandle = null;
+  }
+
+  for (const watcher of controller.watchers) {
+    try {
+      watcher.close();
+    } catch {}
+  }
+
+  controller.watchers = [];
+  controller.watchedPaths = [];
+  maintenanceControllers.delete(key);
+}
+
 async function ensureMaintenanceController(paths, options) {
   const key = maintenanceControllerKey(paths);
   const existing = maintenanceControllers.get(key);
@@ -1758,6 +1786,9 @@ export async function server(input, options = {}) {
   await ensureMaintenanceController(controllerPaths, options);
 
   return {
+    __mercury_shutdown: async () => {
+      await shutdownMaintenanceController(controllerPaths);
+    },
     tool: {
       pkm_bootstrap: tool({
         description: "Bootstrap or reinitialize a portable PKM vault and hot-memory layer.",
