@@ -2,8 +2,6 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { server } from "./dist/server.js";
-
 function contextStub() {
   return {
     metadata() {},
@@ -25,10 +23,15 @@ async function main() {
   const vaultPath = path.join(root, "Vault");
   const memoryPath = path.join(root, "memory");
   const sourcePath = path.join(root, "source-notes");
-  const opencodeDbPath = path.join(root, "missing-opencode.db");
+  const opencodeConfigPath = path.join(root, "opencode-config");
+  const opencodeStatePath = path.join(root, "opencode-state");
+  const opencodeDbPath = path.join(opencodeStatePath, "opencode.db");
+  const backupRoot = path.join(root, "backups");
 
   await fs.mkdir(workspace, { recursive: true });
   await fs.mkdir(sourcePath, { recursive: true });
+  await fs.mkdir(opencodeConfigPath, { recursive: true });
+  await fs.mkdir(opencodeStatePath, { recursive: true });
   await fs.writeFile(
     path.join(sourcePath, "project-note.md"),
     `# Migration plan
@@ -40,13 +43,29 @@ Mercury should keep OpenCode current without requiring manual re-reading.
 `,
     "utf8",
   );
+  await fs.writeFile(path.join(opencodeConfigPath, "opencode.json"), '{"plugin":[]}', "utf8");
+  await fs.writeFile(path.join(opencodeStatePath, "auth.json"), '{"provider":"test"}', "utf8");
+
+  process.env.HOME = root;
+  const { id, default: pluginModule, server } = await import(`./dist/server.js?ts=${Date.now()}`);
+
+  if (typeof id !== "string" || !id.trim()) {
+    throw new Error("Expected Mercury to export a non-empty plugin id");
+  }
+  if (pluginModule?.id !== id || pluginModule?.server !== server) {
+    throw new Error("Expected default export to expose the Mercury id and server contract");
+  }
 
   const plugin = await server(
     { directory: workspace },
     {
       vaultPath,
       memoryPath,
+      opencodeConfigPath,
       opencodeDbPath,
+      backupRoot,
+      backupIntervalMs: 1_000,
+      backupRetentionCount: 3,
       userDisplayName: "Smoke Test User",
       primaryWork: "Testing Mercury",
     },
@@ -59,7 +78,11 @@ Mercury should keep OpenCode current without requiring manual re-reading.
       {
         vaultPath,
         memoryPath,
+        opencodeConfigPath,
         opencodeDbPath,
+        backupRoot,
+        backupIntervalMs: 1_000,
+        backupRetentionCount: 3,
         userDisplayName: "Smoke Test User",
         primaryWork: "Testing Mercury",
       },
@@ -79,7 +102,10 @@ Mercury should keep OpenCode current without requiring manual re-reading.
       return liveStatus.autonomousMaintenanceActive
         && liveStatus.backgroundIntervalActive
         && liveStatus.pendingDropboxFiles.length === 0
-        && Boolean(liveStatus.lastBackgroundTickAt);
+        && Boolean(liveStatus.lastBackgroundTickAt)
+        && Boolean(liveStatus.backups.vault.lastSnapshotPath)
+        && Boolean(liveStatus.backups.opencodeConfig.lastSnapshotPath)
+        && Boolean(liveStatus.backups.opencodeState.lastSnapshotPath);
     });
 
     if (!updatedItself) {
@@ -93,6 +119,16 @@ Mercury should keep OpenCode current without requiring manual re-reading.
     if (!status.autonomousMaintenanceActive || !status.backgroundIntervalActive) {
       throw new Error("Expected autonomous maintenance controller to be active");
     }
+    const backupErrors = Object.entries(status.backups).filter(([, value]) => value.lastError);
+    if (backupErrors.length) {
+      throw new Error(`Expected smoke backups to be clean, found errors in scopes: ${backupErrors.map(([scope]) => scope).join(", ")}`);
+    }
+
+    await Promise.all([
+      fs.access(status.backups.vault.lastSnapshotPath),
+      fs.access(status.backups.opencodeConfig.lastSnapshotPath),
+      fs.access(status.backups.opencodeState.lastSnapshotPath),
+    ]);
 
     const inboxEntries = await fs.readdir(path.join(vaultPath, "00-09 Inbox"));
     if (!inboxEntries.some((entry) => entry.includes("Dropped Note"))) {
@@ -105,10 +141,22 @@ Mercury should keep OpenCode current without requiring manual re-reading.
       throw new Error("Expected system context injection from Mercury");
     }
 
+    const errorLogPath = path.join(memoryPath, "logs", "plugin-errors.log");
+    let errorLog = "";
+    try {
+      errorLog = await fs.readFile(errorLogPath, "utf8");
+    } catch {}
+    if (errorLog.trim()) {
+      throw new Error(`Expected clean plugin error log during smoke run, found:\n${errorLog}`);
+    }
+
     console.log(JSON.stringify({
       smoke: "ok",
+      id,
       indexedKnowledgeFiles: status.indexedKnowledgeFiles,
       pendingDropboxFiles: status.pendingDropboxFiles,
+      backupRoot: status.backupRoot,
+      backupScopes: Object.fromEntries(Object.entries(status.backups).map(([key, value]) => [key, Boolean(value.lastSnapshotPath)])),
       injectedChars: systemOutput.system[0].length,
     }, null, 2));
   } finally {

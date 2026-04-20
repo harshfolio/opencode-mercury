@@ -12,6 +12,9 @@
   "bugs": {
     "url": "https://github.com/harshfolio/opencode-mercury/issues"
   },
+  "engines": {
+    "opencode": ">=0.1.0"
+  },
   "main": "./dist/server.js",
   "exports": {
     ".": "./dist/server.js",
@@ -36,8 +39,11 @@
     "access": "restricted"
   },
   "scripts": {
-    "check": "node --check dist/server.js",
-    "smoke": "node smoke.mjs",
-    "verify": "npm run check && npm run smoke"
+    "build": "node scripts/build.mjs",
+    "check": "node --check src/server.js && npm run build && node --check dist/server.js",
+    "test:contract": "npm run build && node tests/contract.test.mjs",
+    "smoke": "npm run build && node smoke.mjs",
+    "dev:sandbox": "npm run build && node scripts/dev-sandbox.mjs",
+    "verify": "npm run check && npm run test:contract && npm run smoke"
   }
 }
