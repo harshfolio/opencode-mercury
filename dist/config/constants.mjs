@@ -27,7 +27,7 @@ export const BACKUP_SCOPE_DEFINITIONS = [
   {
     key: "vault",
     directoryName: "vault",
-    label: "Vault42",
+    label: "Vault",
     excludedPrefixes: [".git", ".obsidian/cache", ".trash"],
   },
   {
