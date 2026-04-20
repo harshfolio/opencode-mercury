@@ -1,6 +1,6 @@
 {
   "name": "@harshfolio/opencode-mercury",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Private OpenCode plugin that bootstraps a portable PKM vault, imports knowledge, and maintains hot memory for any user.",
   "type": "module",
   "license": "MIT",
