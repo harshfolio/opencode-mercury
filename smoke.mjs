@@ -2,6 +2,55 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+async function seedOpencodeDb(opencodeDbPath, workspace) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(opencodeDbPath);
+  db.exec(`
+    CREATE TABLE session (
+      id TEXT PRIMARY KEY,
+      title TEXT,
+      directory TEXT,
+      time_updated INTEGER
+    );
+    CREATE TABLE message (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      data TEXT,
+      time_created INTEGER
+    );
+    CREATE TABLE part (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id TEXT,
+      data TEXT,
+      time_created INTEGER
+    );
+  `);
+
+  const now = Date.now();
+  db.prepare("INSERT INTO session (id, title, directory, time_updated) VALUES (?, ?, ?, ?)")
+    .run("session-1", "New session - scratch", workspace, now);
+
+  db.prepare("INSERT INTO message (id, session_id, data, time_created) VALUES (?, ?, ?, ?)")
+    .run("message-user-1", "session-1", JSON.stringify({ role: "user" }), now - 2_000);
+  db.prepare("INSERT INTO part (message_id, data, time_created) VALUES (?, ?, ?)")
+    .run(
+      "message-user-1",
+      JSON.stringify({ type: "text", text: "CONTEXT: Evaluating a skincare concierge app concept. Need to understand the state of AI skin scanning technology and progress tracking." }),
+      now - 1_900,
+    );
+
+  db.prepare("INSERT INTO message (id, session_id, data, time_created) VALUES (?, ?, ?, ?)")
+    .run("message-assistant-1", "session-1", JSON.stringify({ role: "assistant" }), now - 1_000);
+  db.prepare("INSERT INTO part (message_id, data, time_created) VALUES (?, ?, ?)")
+    .run(
+      "message-assistant-1",
+      JSON.stringify({ type: "text", text: "Key finding: Clinical credibility plus Rx pathway is the defensible moat. Progress tracking is the retention primitive." }),
+      now - 900,
+    );
+
+  db.close();
+}
+
 function contextStub() {
   return {
     metadata() {},
@@ -32,6 +81,7 @@ async function main() {
   await fs.mkdir(sourcePath, { recursive: true });
   await fs.mkdir(opencodeConfigPath, { recursive: true });
   await fs.mkdir(opencodeStatePath, { recursive: true });
+  await seedOpencodeDb(opencodeDbPath, workspace);
   await fs.writeFile(
     path.join(sourcePath, "project-note.md"),
     `# Migration plan
@@ -140,6 +190,13 @@ Mercury should keep OpenCode current without requiring manual re-reading.
     await plugin["experimental.chat.system.transform"]({}, systemOutput);
     if (!systemOutput.system.length) {
       throw new Error("Expected system context injection from Mercury");
+    }
+    const systemText = systemOutput.system.join("\n");
+    if (!systemText.includes("Clinical credibility plus Rx pathway is the defensible moat.")) {
+      throw new Error("Expected Mercury to surface synthesized session outcome summaries");
+    }
+    if (systemText.includes("Need to understand the state of AI skin scanning technology")) {
+      throw new Error("Expected Mercury to avoid surfacing raw prompt fragments when an outcome summary exists");
     }
 
     const errorLogPath = path.join(memoryPath, "logs", "plugin-errors.log");
