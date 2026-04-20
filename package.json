@@ -44,6 +44,7 @@
     "test:contract": "npm run build && node tests/contract.test.mjs",
     "smoke": "npm run build && node smoke.mjs",
     "dev:sandbox": "npm run build && node scripts/dev-sandbox.mjs",
+    "migrate:live-config": "npm run build && node scripts/migrate-live-config.mjs",
     "verify": "npm run check && npm run test:contract && npm run smoke"
   }
 }
