@@ -1,0 +1,50 @@
+name: Mercury
+repo: https://github.com/harshfolio/opencode-mercury
+tagline: Persistent local memory for OpenCode that stays compact, current, and session-aware.
+description: |
+  Mercury is an OpenCode plugin that keeps a compact local memory layer fresh while you work.
+  - Maintains overview and active context automatically
+  - Backfills useful session context from local OpenCode state
+  - Indexes vault knowledge without turning memory into prompt bloat
+  - Preserves user priorities, reminders, and corrections across sessions
+scope:
+  - global
+  - project
+tags:
+  - memory
+  - persistence
+  - productivity
+  - knowledge-management
+  - context
+min_version: "1.0.0"
+homepage: https://github.com/harshfolio/opencode-mercury#readme
+installation: |
+  ## Quick start
+
+  ```bash
+  git clone https://github.com/harshfolio/opencode-mercury ~/.config/opencode/plugins/opencode-mercury
+  cd ~/.config/opencode/plugins/opencode-mercury
+  npm install
+  npm run build
+  ```
+
+  Add the built plugin to `~/.config/opencode/opencode.json`:
+
+  ```json
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "plugin": [
+      [
+        "file:///Users/YOUR_NAME/.config/opencode/plugins/opencode-mercury/dist/server.js",
+        {
+          "vaultPath": "~/Documents/Vault",
+          "memoryPath": "~/.config/opencode/memory",
+          "opencodeConfigPath": "~/.config/opencode",
+          "backupRoot": "~/Library/Application Support/opencode-mercury/backups"
+        }
+      ]
+    ]
+  }
+  ```
+
+  Run `pkm_bootstrap` once, then use `pkm_status` or `pkm_refresh` to verify the setup.

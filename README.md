@@ -1,18 +1,98 @@
-# OpenCode Mercury
+# Mercury
 
-A private installable OpenCode plugin that gives any user:
-- a portable PKM vault
-- a compact hot-memory layer
-- existing-knowledge import into that vault
-- vault re-indexing while OpenCode is active
-- OpenCode session backfill from the local OpenCode database
-- automatic session-aware memory refresh while OpenCode is active
-- periodic backups for the vault, OpenCode config, and OpenCode runtime state
-- dropbox-style note ingestion into the vault inbox
+Mercury is an OpenCode plugin that keeps a **compact, local memory layer** fresh while you work.
 
-## What it creates
+It is built for the gap between stateless sessions and bloated memory dumps:
+
+- keep current context warm across sessions
+- remember priorities, reminders, and corrections
+- index vault knowledge without shoving the whole vault into prompts
+- stay local-first, inspectable, and backup-friendly
+
+## What Mercury gives you
+
+- **Overview + active context** injected automatically into OpenCode
+- **Session continuity** from recent local OpenCode activity
+- **Vault knowledge indexing** with compact summaries
+- **Dropbox note ingestion** into a structured vault inbox
+- **Backups** for vault, OpenCode config, and runtime state
+- **Manual tools** for bootstrap, refresh, import, ingest, and status
+
+## Quick start
+
+### Option 1: Install from source (recommended today)
+
+```bash
+git clone https://github.com/harshfolio/opencode-mercury ~/.config/opencode/plugins/opencode-mercury
+cd ~/.config/opencode/plugins/opencode-mercury
+npm install
+npm run build
+```
+
+Add Mercury to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "file:///Users/YOUR_NAME/.config/opencode/plugins/opencode-mercury/dist/server.js",
+      {
+        "vaultPath": "~/Documents/Vault",
+        "memoryPath": "~/.config/opencode/memory",
+        "opencodeConfigPath": "~/.config/opencode",
+        "backupRoot": "~/Library/Application Support/opencode-mercury/backups",
+        "backupIntervalHours": 12,
+        "backupRetentionCount": 14,
+        "userDisplayName": "Your Name",
+        "primaryWork": "Product, engineering, research, or operations"
+      }
+    ]
+  ]
+}
+```
+
+Then run:
+
+- `pkm_bootstrap` once to scaffold files
+- `pkm_status` to confirm health
+- `pkm_refresh` if you want an immediate full rebuild
+
+### Option 2: Install from GitHub Packages
+
+Mercury also ships as `@harshfolio/opencode-mercury` through GitHub Packages.
+
+That path requires npm auth for `https://npm.pkg.github.com`.
+
+```ini
+@harshfolio:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=YOUR_GITHUB_TOKEN
+```
+
+## Runtime requirements
+
+- Node.js 22+
+- An OpenCode build with these hooks:
+  - `chat.message`
+  - `command.execute.before`
+  - `experimental.chat.system.transform`
+  - `experimental.session.compacting`
+
+Mercury supports SQLite access in both Bun-hosted and Node-hosted OpenCode runtimes.
+
+## Tools
+
+- `pkm_bootstrap` — initialize or reinitialize the vault + memory scaffold
+- `pkm_status` — inspect configured paths and memory health
+- `pkm_refresh` — force a full refresh across sessions, vault knowledge, and derived memory
+- `pkm_backup_now` — force immediate backups
+- `pkm_import_knowledge` — import or re-index existing notes
+- `pkm_ingest_note` — turn raw note text into a vault inbox note immediately
+
+## What Mercury creates
 
 ### Vault
+
 - `Vault Home.md`
 - `AGENTS.md`
 - `00-09 Inbox/`
@@ -24,6 +104,7 @@ A private installable OpenCode plugin that gives any user:
 - `_agent/context.md`
 
 ### Hot memory
+
 - `overview.md`
 - `user-profile.md`
 - `current-priorities.md`
@@ -36,152 +117,51 @@ A private installable OpenCode plugin that gives any user:
 - `logs/`
 - `domains/`
 
-Mercury also manages `dropbox/processed`, `dropbox/failed`, and extra domain files such as `domains/social-media.md` and `domains/finance.md`.
+Mercury also manages `dropbox/processed`, `dropbox/failed`, and additional domain files as it learns more about the working set.
 
-## Runtime requirements
+## How it works
 
-- Node.js 22+ (Mercury uses `node:sqlite`)
-- An OpenCode build that supports the hooks Mercury uses: `chat.message`, `command.execute.before`, `experimental.chat.system.transform`, and `experimental.session.compacting`
+Mercury is **hook-driven**, not daemon-driven.
+
+While OpenCode is active, Mercury keeps itself fresh through:
+
+1. **Startup maintenance** when the plugin loads
+2. **Background maintenance** on a fixed interval while OpenCode stays open
+3. **Watch-triggered maintenance** when vault or dropbox files change
+
+In practice it does four kinds of work:
+
+- keeps session continuity current
+- backfills useful local OpenCode activity
+- indexes vault knowledge into compact summaries
+- injects overview + active context into the system prompt with hard budgets
 
 ## Backup coverage
 
-By default Mercury snapshots three surfaces into a backup root outside the vault/config trees:
+By default Mercury snapshots three surfaces outside the vault/config trees:
 
 - the configured vault
-- the OpenCode config root (usually `~/.config/opencode`)
-- the OpenCode runtime/state directory that contains `opencode.db`
+- the OpenCode config root
+- the OpenCode runtime/state directory containing `opencode.db`
 
 Defaults:
 
 - backup interval: every 12 hours while OpenCode is active
 - retention: last 14 snapshots per scope
-- default backup root on macOS: `~/Library/Application Support/opencode-mercury/backups`
+- default macOS backup root: `~/Library/Application Support/opencode-mercury/backups`
 
-## Install
+## Migrating an existing setup
 
-Add the plugin to `opencode.json`:
+If you already use a vault plus `~/.config/opencode/memory`, point Mercury at those same paths so it owns the same memory surface instead of creating a parallel setup.
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "@harshfolio/opencode-mercury",
-      {
-        "vaultPath": "~/Documents/Vault42",
-        "memoryPath": "~/.config/opencode/memory",
-        "opencodeConfigPath": "~/.config/opencode",
-        "backupRoot": "~/Library/Application Support/opencode-mercury/backups",
-        "backupIntervalHours": 12,
-        "backupRetentionCount": 14,
-        "userDisplayName": "Your Name",
-        "primaryWork": "Product, engineering, and operations"
-      }
-    ]
-  ]
-}
-```
+Recommended flow:
 
-Or install with:
+1. Repoint Mercury at your existing vault and memory paths
+2. Run `pkm_bootstrap` once to ensure scaffold files exist
+3. Run `pkm_import_knowledge` if you want to copy notes from outside the vault
+4. Run `pkm_refresh` once to rebuild derived memory and the knowledge index
 
-```bash
-opencode plugin @harshfolio/opencode-mercury --global
-```
-
-For local development on this machine, prefer the built entrypoint instead of the repo directory:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "file:///Users/harshsharma/Documents/Side%20Projects/opencode-pkm-memory-plugin/dist/server.js",
-      {
-        "vaultPath": "~/Documents/Vault42",
-        "memoryPath": "~/.config/opencode/memory",
-        "opencodeConfigPath": "~/.config/opencode",
-        "backupRoot": "~/Library/Application Support/opencode-mercury/backups"
-      }
-    ]
-  ]
-}
-```
-
-## Private package publishing
-
-This package is configured for GitHub Packages as a private scoped package under `@harshfolio`.
-
-To install from GitHub Packages, the user needs npm auth for `npm.pkg.github.com`.
-
-Example `.npmrc`:
-
-```ini
-@harshfolio:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=YOUR_GITHUB_TOKEN
-```
-
-## How it works
-
-- On first use, it scaffolds a generic vault and memory layer if they do not exist.
-- Mercury is hook-driven, not daemon-driven: while OpenCode is active, chat/command/system hooks keep the memory layer fresh without requiring launchd/cron.
-- Mercury starts an autonomous maintenance controller on plugin load, so it can keep refreshing while OpenCode stays open.
-- On each user message, it updates session-ledger state and recent-work context without doing the heavier vault walk.
-- It opportunistically backfills recent OpenCode sessions and corrections from the local `opencode.db`.
-- It scans the configured vault on maintenance intervals while OpenCode is active and also reacts to vault/dropbox file-watch events when supported.
-- On each command run, it opportunistically ingests notes dropped into the memory dropbox.
-- It injects both `overview.md` and `active-context.md` into the OpenCode system context with a capped context budget so the agent starts with compact, current context instead of bloated history.
-- `pkm_refresh` exists as an escape hatch, not the normal maintenance path.
-- `pkm_status` reports whether local `opencode.db` backfill is actually available, plus whether core state files were readable.
-- The same maintenance controller also creates periodic backups for the vault, OpenCode config, and OpenCode runtime state.
-
-In practice, Mercury stays updated in three layers:
-
-1. **Startup maintenance** when the plugin loads
-2. **Autonomous background maintenance** on a fixed interval while OpenCode is open
-3. **Watch-triggered maintenance** when vault or dropbox files change
-
-## Tools
-
-- `pkm_bootstrap` — initialize or reinitialize the vault + memory scaffold
-- `pkm_status` — inspect configured paths and current memory health
-- `pkm_refresh` — force a full refresh across sessions, vault knowledge, and derived memory
-- `pkm_backup_now` — force immediate backups for the vault and OpenCode surfaces Mercury protects
-- `pkm_import_knowledge` — import or re-index existing notes so Mercury can learn from them
-- `pkm_ingest_note` — turn raw note text into a vault inbox note immediately
-
-`pkm_status` also reports whether local `opencode.db` backfill is available on the current machine, plus backup root, interval, retention, and last snapshot metadata.
-
-## Current setup migration
-
-If you already use `Vault42` plus `~/.config/opencode/memory`, point Mercury at those same paths so the plugin owns the same memory surface instead of creating a second parallel setup:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "@harshfolio/opencode-mercury",
-      {
-        "vaultPath": "~/Documents/Vault42",
-        "memoryPath": "~/.config/opencode/memory",
-        "opencodeConfigPath": "~/.config/opencode",
-        "backupRoot": "~/Library/Application Support/opencode-mercury/backups",
-        "backupIntervalHours": 12,
-        "backupRetentionCount": 14
-      }
-    ]
-  ]
-}
-```
-
-Recommended migration flow:
-
-1. Repoint Mercury at your existing vault and memory paths.
-2. Run `pkm_bootstrap` once to ensure missing Mercury scaffold files exist.
-3. Run `pkm_import_knowledge` if you want Mercury to copy notes from outside the configured vault. Use `index` mode only for paths already inside the configured vault.
-4. Run `pkm_refresh` once after migration to rebuild derived memory and the knowledge index.
-
-On this machine, the repo also includes a scripted live-config migration:
+For this repo, there is also a local helper:
 
 ```bash
 npm run migrate:live-config
@@ -189,44 +169,53 @@ npm run migrate:live-config
 
 That script:
 
-- builds the latest Mercury dist files
-- rewrites the live OpenCode plugin entry to `file:///.../dist/server.js`
-- explicitly allows Mercury's working directories (`Vault42`, `~/.config/opencode/memory`, and the Mercury backup root) in `external_directory`
+- builds the latest dist files
+- rewrites the local OpenCode plugin entry to the built Mercury file
+- sets persistent `external_directory` allowlist rules for Mercury-owned paths
 
-## Sandboxed development loop
+## Sandboxed development
 
-Mercury is safest to develop against an isolated OpenCode HOME first, not the live profile.
-
-Create the sandbox:
+Mercury is safest to develop against an isolated OpenCode HOME first.
 
 ```bash
 npm run dev:sandbox
+HOME="$(pwd)/.sandbox/mercury-dev/home" opencode
 ```
 
-Launch OpenCode inside it:
-
-```bash
-HOME="/Users/harshsharma/Documents/Side Projects/opencode-pkm-memory-plugin/.sandbox/mercury-dev/home" opencode
-```
-
-What this gives you:
-
-- isolated OpenCode config/state under `.sandbox/mercury-dev/home`
-- Mercury loaded from `dist/server.js`
-- sandbox-only Vault42, memory, backup root, and OpenCode database surfaces
-- a safe place to validate plugin loading before touching the live profile
-
-Recommended local workflow:
+Recommended workflow:
 
 1. `npm run verify`
 2. `npm run dev:sandbox`
-3. Launch sandboxed OpenCode and verify Mercury loads cleanly
-4. Only then run `npm run migrate:live-config` or update the live profile manually
+3. validate Mercury in the sandbox
+4. only then update the live profile
+
+## Troubleshooting
+
+### Mercury still asks for path access
+
+Make sure the configured Mercury paths are allowlisted in `external_directory` and restart OpenCode fully. Fresh processes pick up config reliably; already-open processes may still use cached permission state.
+
+### Local activity backfill is unavailable
+
+`pkm_status` reports whether local `opencode.db` access is available. If it is false, confirm the runtime can access SQLite and that the configured OpenCode state path is correct.
+
+### Refreshes feel slow on very large vaults
+
+Mercury currently favors correctness over aggressive incremental indexing. The current releases already cache hot state and reduce repeated recomputation, but very large vaults will still benefit from future incremental indexing work.
 
 ## Design goals
 
-- user-agnostic
-- device-agnostic
-- small hot context, deep durable vault
-- no personal hardcoded paths beyond configurable defaults
-- no dependence on launchd/cron to function
+- local-first
+- compact hot context, deep durable knowledge
+- minimal prompt bloat
+- portable vault and memory surfaces
+- no cloud dependency for core memory flows
+
+## Public launch assets
+
+- `docs/awesome-opencode-plugin.yaml` contains a ready-to-submit awesome-opencode entry draft
+- GitHub Releases are used for versioned public release notes
+
+## License
+
+MIT
