@@ -41,6 +41,7 @@ async function main() {
       "pkm_backup_now",
       "pkm_import_knowledge",
       "pkm_ingest_note",
+      "pkm_remember",
     ];
 
     for (const toolName of toolNames) {
