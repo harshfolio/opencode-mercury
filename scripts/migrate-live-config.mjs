@@ -7,11 +7,15 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const configPath = path.join(os.homedir(), ".config", "opencode", "opencode.json");
 const distEntry = path.join(repoRoot, "dist", "server.js");
 const pluginUrl = pathToFileURL(distEntry).href;
+const homeDir = os.homedir();
 
 const mercuryAllowlist = {
-  "/Users/harshsharma/Documents/Vault42/*": "allow",
-  "/Users/harshsharma/.config/opencode/memory/*": "allow",
-  "/Users/harshsharma/Library/Application Support/opencode-mercury/*": "allow",
+  [path.join(homeDir, "Documents", "Vault42")]: "allow",
+  [`${path.join(homeDir, "Documents", "Vault42")}/**`]: "allow",
+  [path.join(homeDir, ".config", "opencode", "memory")]: "allow",
+  [`${path.join(homeDir, ".config", "opencode", "memory")}/**`]: "allow",
+  [path.join(homeDir, "Library", "Application Support", "opencode-mercury")]: "allow",
+  [`${path.join(homeDir, "Library", "Application Support", "opencode-mercury")}/**`]: "allow",
 };
 
 function normalizePluginEntry(entry) {
@@ -42,8 +46,8 @@ async function main() {
   config.plugin = nextPlugins;
   config.permission = config.permission || {};
   config.permission.external_directory = {
-    ...mercuryAllowlist,
     ...(config.permission.external_directory || {}),
+    ...mercuryAllowlist,
   };
 
   await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
