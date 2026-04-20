@@ -224,6 +224,69 @@ function parseSections(markdown) {
   return sections;
 }
 
+function splitFrontmatter(markdown) {
+  const source = String(markdown || "");
+  if (!source.startsWith("---\n")) return { frontmatter: "", body: source };
+  const end = source.indexOf("\n---\n", 4);
+  if (end === -1) return { frontmatter: "", body: source };
+  return {
+    frontmatter: source.slice(0, end + 5),
+    body: source.slice(end + 5),
+  };
+}
+
+function updateFrontmatterValue(frontmatter, key, value) {
+  const clean = String(frontmatter || "");
+  if (!clean.trim()) {
+    return `---\n${key}: ${value}\n---\n\n`;
+  }
+  const lines = clean.trimEnd().split(/\r?\n/);
+  const nextEntry = `${key}: ${value}`;
+  const index = lines.findIndex((line, lineIndex) => lineIndex > 0 && lineIndex < lines.length - 1 && line.startsWith(`${key}:`));
+  if (index >= 0) lines[index] = nextEntry;
+  else lines.splice(lines.length - 1, 0, nextEntry);
+  return `${lines.join("\n")}\n\n`;
+}
+
+function normalizeBulletItem(content) {
+  const clean = String(content || "").trim().replace(/^-\s+/, "");
+  return clean ? `- ${clean}` : "";
+}
+
+function upsertBulletSection(markdown, sectionTitle, content) {
+  const bullet = normalizeBulletItem(content);
+  if (!bullet) return String(markdown || "");
+
+  const { frontmatter, body } = splitFrontmatter(markdown);
+  const lines = body.split(/\r?\n/);
+  const heading = `## ${sectionTitle}`;
+  const sectionStart = lines.findIndex((line) => line.trim() === heading);
+
+  if (sectionStart === -1) {
+    const bodyText = body.trimEnd();
+    const section = `${heading}\n${bullet}`;
+    return `${frontmatter}${bodyText ? `${bodyText}\n\n${section}\n` : `${section}\n`}`;
+  }
+
+  let sectionEnd = lines.length;
+  for (let index = sectionStart + 1; index < lines.length; index += 1) {
+    if (lines[index].startsWith("## ")) {
+      sectionEnd = index;
+      break;
+    }
+  }
+
+  const sectionLines = lines.slice(sectionStart + 1, sectionEnd).map((line) => line.trim());
+  if (sectionLines.includes(bullet)) {
+    return `${frontmatter}${body}`;
+  }
+
+  let insertAt = sectionEnd;
+  while (insertAt > sectionStart + 1 && !lines[insertAt - 1].trim()) insertAt -= 1;
+  lines.splice(insertAt, 0, bullet);
+  return `${frontmatter}${lines.join("\n")}`;
+}
+
 function bulletLines(markdown, section) {
   const sections = parseSections(markdown);
   return (sections.get(section) || [])
@@ -1024,6 +1087,28 @@ async function readCurrentPriorities(paths) {
     .filter((line) => line.startsWith("- "));
   if (fallbackBullets.length) return fallbackBullets.slice(0, 5);
   return priorities.length ? priorities.slice(0, 5) : DEFAULT_PRIORITIES;
+}
+
+const MEMORY_PROFILE_SECTIONS = {
+  identity: "Identity",
+  "account-map": "Account Map",
+  "general-work-baseline": "General Work Baseline",
+  "working-preferences": "Working Preferences",
+  "stable-preferences": "Stable Preferences",
+};
+
+async function rememberProfileFact(paths, category, content) {
+  const sectionTitle = MEMORY_PROFILE_SECTIONS[category];
+  if (!sectionTitle) {
+    throw new Error(`Unsupported memory category: ${category}`);
+  }
+
+  const currentProfile = await readText(paths.userProfile, renderUserProfile({}));
+  let nextProfile = upsertBulletSection(currentProfile, sectionTitle, content);
+  const split = splitFrontmatter(nextProfile);
+  const updatedFrontmatter = updateFrontmatterValue(split.frontmatter, "updated", todayDate());
+  nextProfile = `${updatedFrontmatter}${split.body.trimStart()}`;
+  await writeText(paths.userProfile, nextProfile.endsWith("\n") ? nextProfile : `${nextProfile}\n`);
 }
 
 async function readVaultFocus(paths) {
@@ -1924,6 +2009,31 @@ ${args.noteText.trim()}
           const result = await maintain(paths, null, options, { force: true, reason: "ingest-note" });
           context.metadata({ title: "Ingested note into Mercury", metadata: { file: target } });
           return JSON.stringify({ file: target, result }, null, 2);
+        },
+      }),
+      pkm_remember: tool({
+        description: "Store a stable user/profile memory fact directly in Mercury's hot-memory profile.",
+        args: {
+          category: tool.schema.string().describe("Target memory category: identity, account-map, general-work-baseline, working-preferences, or stable-preferences"),
+          content: tool.schema.string().describe("Bullet-sized memory fact to persist"),
+        },
+        async execute(args, context) {
+          const paths = await buildPaths(input, options);
+          await ensureScaffold(paths, options, false);
+          await rememberProfileFact(paths, args.category, args.content);
+          await refreshDerivedFiles(paths);
+          const state = await readPluginState(paths);
+          state.lastMaintenanceAt = nowIso();
+          state.lastMaintenanceMs = Date.now();
+          await writePluginState(paths, state);
+          const status = await collectStatus(paths);
+          context.metadata({ title: "Stored Mercury memory", metadata: { category: args.category } });
+          return JSON.stringify({
+            category: args.category,
+            content: normalizeBulletItem(args.content),
+            userProfile: paths.userProfile,
+            status,
+          }, null, 2);
         },
       }),
     },
