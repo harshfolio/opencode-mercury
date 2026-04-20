@@ -34,6 +34,10 @@ export const id = "@harshfolio/opencode-mercury";
 
 const maintenanceControllers = new Map();
 let sqliteDriverPromise = null;
+const fileReadCaches = {
+  ledger: { path: "", mtimeMs: 0, size: 0, value: [] },
+  knowledgeIndex: { path: "", mtimeMs: 0, size: 0, value: { version: 1, updated: "", files: {} }, readError: false },
+};
 
 function dynamicImport(specifier) {
   return new Function("specifier", "return import(specifier);")(specifier);
@@ -329,6 +333,37 @@ async function exists(target) {
   }
 }
 
+async function readFileStats(target) {
+  try {
+    return await fs.stat(target);
+  } catch {
+    return null;
+  }
+}
+
+function resetFileCache(name, target = "") {
+  if (name === "ledger") {
+    fileReadCaches.ledger = { path: target, mtimeMs: 0, size: 0, value: [] };
+    return;
+  }
+  if (name === "knowledgeIndex") {
+    fileReadCaches.knowledgeIndex = {
+      path: target,
+      mtimeMs: 0,
+      size: 0,
+      value: { version: 1, updated: "", files: {} },
+      readError: false,
+    };
+  }
+}
+
+function invalidateDerivedCachesForPath(target) {
+  const normalizedTarget = String(target || "");
+  if (!normalizedTarget) return;
+  if (normalizedTarget === fileReadCaches.ledger.path) resetFileCache("ledger", normalizedTarget);
+  if (normalizedTarget === fileReadCaches.knowledgeIndex.path) resetFileCache("knowledgeIndex", normalizedTarget);
+}
+
 async function ensureDir(target) {
   await fs.mkdir(target, { recursive: true });
 }
@@ -344,6 +379,7 @@ async function readText(target, fallback = "") {
 async function writeText(target, content) {
   await ensureDir(path.dirname(target));
   await fs.writeFile(target, content, "utf8");
+  invalidateDerivedCachesForPath(target);
 }
 
 async function ensureFile(target, content, force = false) {
@@ -373,6 +409,7 @@ async function readJsonFileWithReporting(paths, target, label, fallback) {
 async function appendText(target, content) {
   await ensureDir(path.dirname(target));
   await fs.appendFile(target, content, "utf8");
+  invalidateDerivedCachesForPath(target);
 }
 
 async function moveFile(source, target) {
@@ -727,7 +764,39 @@ async function writePluginState(paths, state) {
 }
 
 async function readKnowledgeIndex(paths) {
+  const stats = await readFileStats(paths.knowledgeIndex);
+  if (!stats) {
+    resetFileCache("knowledgeIndex", paths.knowledgeIndex);
+    return {
+      version: 1,
+      updated: "",
+      files: {},
+      readError: false,
+    };
+  }
+
+  const cached = fileReadCaches.knowledgeIndex;
+  if (
+    cached.path === paths.knowledgeIndex
+    && cached.mtimeMs === stats.mtimeMs
+    && cached.size === stats.size
+  ) {
+    return {
+      version: 1,
+      updated: String(cached.value.updated || ""),
+      files: typeof cached.value.files === "object" && cached.value.files ? cached.value.files : {},
+      readError: cached.readError,
+    };
+  }
+
   const { value: index, readError } = await readJsonFileWithReporting(paths, paths.knowledgeIndex, "knowledge-index", { version: 1, updated: "", files: {} });
+  fileReadCaches.knowledgeIndex = {
+    path: paths.knowledgeIndex,
+    mtimeMs: stats.mtimeMs,
+    size: stats.size,
+    value: index,
+    readError,
+  };
   return {
     version: 1,
     updated: String(index.updated || ""),
@@ -742,6 +811,13 @@ async function writeKnowledgeIndex(paths, index) {
     updated: index.updated || nowIso(),
     files: index.files || {},
   });
+  fileReadCaches.knowledgeIndex = {
+    path: paths.knowledgeIndex,
+    mtimeMs: 0,
+    size: 0,
+    value: { version: 1, updated: index.updated || nowIso(), files: index.files || {} },
+    readError: false,
+  };
 }
 
 async function appendErrorLog(paths, label, error) {
@@ -860,14 +936,36 @@ async function runBackups(paths, state, { force = false, reason = "maintenance" 
 }
 
 async function parseLedger(paths) {
+  const stats = await readFileStats(paths.ledger);
+  if (!stats) {
+    resetFileCache("ledger", paths.ledger);
+    return [];
+  }
+
+  const cached = fileReadCaches.ledger;
+  if (
+    cached.path === paths.ledger
+    && cached.mtimeMs === stats.mtimeMs
+    && cached.size === stats.size
+  ) {
+    return cached.value;
+  }
+
   const raw = await readText(paths.ledger, "");
-  return raw
+  const entries = raw
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => safeJsonParse(line, null))
     .filter(Boolean)
     .sort((left, right) => String(right.updated || "").localeCompare(String(left.updated || "")));
+  fileReadCaches.ledger = {
+    path: paths.ledger,
+    mtimeMs: stats.mtimeMs,
+    size: stats.size,
+    value: entries,
+  };
+  return entries;
 }
 
 async function countJsonLines(target) {
@@ -1184,7 +1282,7 @@ function inferWorkstreams(signals) {
     .slice(0, 4);
 }
 
-async function renderActiveContext(paths) {
+async function buildDerivedMemory(paths) {
   const existing = await readExistingActiveContext(paths);
   const priorities = await readCurrentPriorities(paths);
   const vaultFocus = await readVaultFocus(paths);
@@ -1222,7 +1320,7 @@ async function renderActiveContext(paths) {
 
   const reminderLines = mergeUniqueLines(existing.reminders, DEFAULT_REMINDERS);
 
-  return `---
+  const activeContext = `---
 updated: ${nowIso()}
 source: plugin-auto
 confidence: 0.84
@@ -1251,17 +1349,9 @@ ${(existing.openThreads.length ? existing.openThreads : ["- No open threads capt
 ## Durable Reminders
 ${(reminderLines.length ? reminderLines : DEFAULT_REMINDERS).join("\n")}
 `;
-}
 
-async function renderOverview(paths) {
   const baseline = await readUserBaseline(paths);
-  const priorities = await readCurrentPriorities(paths);
-  const activeContext = await readText(paths.activeContext, "");
-  const workstreams = bulletLines(activeContext, "Active Workstreams").slice(0, 4);
-  const recentSharedWork = bulletLines(activeContext, "Recent Sessions").slice(0, 3);
-  const recentKnowledge = bulletLines(activeContext, "Recent Knowledge").slice(0, 3);
-
-  return `---
+  const overview = `---
 updated: ${nowIso()}
 source: plugin-auto
 confidence: 0.88
@@ -1276,19 +1366,24 @@ ${(baseline.length ? baseline : DEFAULT_BASELINE).join("\n")}
 ${(priorities.length ? priorities : DEFAULT_PRIORITIES).join("\n")}
 
 ## Active Workstreams
-${(workstreams.length ? workstreams : ["- No active workstreams inferred yet"]).join("\n")}
+${(workstreams.length ? workstreams.map((item) => `- ${item.label} — ${item.evidence}`) : ["- No active workstreams inferred yet"]).join("\n")}
 
 ## Recent Shared Work
-${(recentSharedWork.length ? recentSharedWork : ["- No recent shared work captured yet"]).join("\n")}
+${recentSessionLines.slice(0, 3).join("\n")}
 
 ## Recent Knowledge
-${(recentKnowledge.length ? recentKnowledge : ["- No recent knowledge captured yet"]).join("\n")}
+${recentKnowledgeLines.slice(0, 3).join("\n")}
 `;
+
+  return { activeContext, overview };
 }
 
 async function refreshDerivedFiles(paths) {
-  await writeText(paths.activeContext, await renderActiveContext(paths));
-  await writeText(paths.overview, await renderOverview(paths));
+  const derived = await buildDerivedMemory(paths);
+  await Promise.all([
+    writeText(paths.activeContext, derived.activeContext),
+    writeText(paths.overview, derived.overview),
+  ]);
 }
 
 async function listPendingDropboxFiles(paths) {
