@@ -33,27 +33,64 @@ import {
 export const id = "@harshfolio/opencode-mercury";
 
 const maintenanceControllers = new Map();
-let databaseSyncCtorPromise = null;
+let sqliteDriverPromise = null;
 
 function dynamicImport(specifier) {
   return new Function("specifier", "return import(specifier);")(specifier);
 }
 
-async function resolveDatabaseSync() {
-  if (!databaseSyncCtorPromise) {
-    databaseSyncCtorPromise = dynamicImport("node:sqlite").then((module) => {
-      if (typeof module?.DatabaseSync !== "function") {
-        throw new Error("`node:sqlite` did not expose DatabaseSync");
+async function resolveSqliteDriver() {
+  if (!sqliteDriverPromise) {
+    sqliteDriverPromise = (async () => {
+      let nodeSqliteError = null;
+      try {
+        const module = await dynamicImport("bun:sqlite");
+        if (typeof module?.Database === "function") {
+          return {
+            runtime: "bun:sqlite",
+            open(dbPath) {
+              return new module.Database(dbPath);
+            },
+            queryAll(db, sql, ...params) {
+              return db.query(sql).all(...params);
+            },
+            close(db) {
+              db.close(false);
+            },
+          };
+        }
+      } catch {}
+
+      try {
+        const module = await dynamicImport("node:sqlite");
+        if (typeof module?.DatabaseSync !== "function") {
+          throw new Error("`node:sqlite` did not expose DatabaseSync");
+        }
+        return {
+          runtime: "node:sqlite",
+          open(dbPath) {
+            return new module.DatabaseSync(dbPath);
+          },
+          queryAll(db, sql, ...params) {
+            return db.prepare(sql).all(...params);
+          },
+          close(db) {
+            db.close();
+          },
+        };
+      } catch (error) {
+        nodeSqliteError = error;
       }
-      return module.DatabaseSync;
-    });
+
+      throw nodeSqliteError || new Error("No compatible SQLite runtime available");
+    })();
   }
-  return databaseSyncCtorPromise;
+  return sqliteDriverPromise;
 }
 
 async function hasSqliteSupport() {
   try {
-    await resolveDatabaseSync();
+    await resolveSqliteDriver();
     return true;
   } catch {
     return false;
@@ -744,12 +781,12 @@ async function pruneBackupSnapshots(scopeRoot, retentionCount) {
 }
 
 async function createDirectorySnapshot(sourceRoot, scopeRoot, backupRoot, excludedPrefixes, snapshotName) {
-  const snapshotPath = path.join(scopeRoot, snapshotName);
   await ensureDir(scopeRoot);
+  const snapshotPath = await uniqueTargetPath(path.join(scopeRoot, snapshotName));
   await fs.cp(sourceRoot, snapshotPath, {
     recursive: true,
     force: true,
-    preserveTimestamps: true,
+    preserveTimestamps: false,
     filter: backupFilterFor(sourceRoot, backupRoot, excludedPrefixes),
   });
   return snapshotPath;
@@ -896,12 +933,15 @@ async function readVaultFocus(paths) {
 }
 
 async function connectDb(dbPath) {
-  const DatabaseSync = await resolveDatabaseSync();
-  return new DatabaseSync(dbPath);
+  const driver = await resolveSqliteDriver();
+  return {
+    driver,
+    handle: driver.open(dbPath),
+  };
 }
 
 function queryAll(db, sql, ...params) {
-  return db.prepare(sql).all(...params);
+  return db.driver.queryAll(db.handle, sql, ...params);
 }
 
 function firstUserPrompt(db, sessionID) {
@@ -944,7 +984,7 @@ async function buildSessionSummariesFromDb(paths, limit = MAX_RECENT_SESSIONS) {
       };
     });
   } finally {
-    db?.close();
+    db?.driver.close(db.handle);
   }
 }
 
@@ -994,7 +1034,7 @@ async function extractCorrectionCandidates(paths, sinceMs) {
     }
     return entries;
   } finally {
-    db?.close();
+    db?.driver.close(db.handle);
   }
 }
 
