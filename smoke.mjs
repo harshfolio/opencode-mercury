@@ -72,6 +72,7 @@ Mercury should keep OpenCode current without requiring manual re-reading.
   );
 
   const context = contextStub();
+  let shutdownPromise = Promise.resolve();
 
   try {
     await plugin.tool.pkm_bootstrap.execute(
@@ -160,6 +161,8 @@ Mercury should keep OpenCode current without requiring manual re-reading.
       injectedChars: systemOutput.system[0].length,
     }, null, 2));
   } finally {
+    shutdownPromise = plugin?.__mercury_shutdown ? plugin.__mercury_shutdown() : Promise.resolve();
+    await shutdownPromise;
     await fs.rm(root, { recursive: true, force: true });
   }
 }

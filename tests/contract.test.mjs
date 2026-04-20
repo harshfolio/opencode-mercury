@@ -14,6 +14,7 @@ async function main() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mercury-contract-"));
   const previousHome = process.env.HOME;
   process.env.HOME = root;
+  let plugin = null;
 
   try {
     const workspace = path.join(root, "workspace");
@@ -30,7 +31,7 @@ async function main() {
     assert.equal(pluginModule.default.id, pluginModule.id, "Default export should expose the same id");
     assert.equal(pluginModule.default.server, pluginModule.server, "Default export should expose server()");
 
-    const plugin = await pluginModule.server({ directory: workspace }, {});
+    plugin = await pluginModule.server({ directory: workspace }, {});
     assert.ok(plugin.tool, "Plugin should register tools");
 
     const toolNames = [
@@ -65,6 +66,7 @@ async function main() {
     }, null, 2));
   } finally {
     process.env.HOME = previousHome;
+    await (plugin?.__mercury_shutdown ? plugin.__mercury_shutdown() : Promise.resolve());
     await fs.rm(root, { recursive: true, force: true });
   }
 }
