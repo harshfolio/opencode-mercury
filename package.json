@@ -40,7 +40,7 @@
     "@opencode-ai/plugin": "^1.4.3"
   },
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com",
+    "registry": "https://registry.npmjs.org",
     "access": "public"
   },
   "scripts": {
