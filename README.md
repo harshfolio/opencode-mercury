@@ -145,6 +145,11 @@ By default Mercury snapshots three surfaces outside the vault/config trees:
 - the OpenCode config root
 - the OpenCode runtime/state directory containing `opencode.db`
 
+To keep backups operational on local machines, Mercury intentionally skips bulky disposable OpenCode surfaces during snapshots:
+
+- `profiles/` under the OpenCode config root
+- `storage/` and `snapshot/` under the OpenCode runtime root
+
 Defaults:
 
 - backup interval: every 12 hours while OpenCode is active

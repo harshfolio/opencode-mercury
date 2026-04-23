@@ -1,6 +1,6 @@
 {
   "name": "@harshfolio/opencode-mercury",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Persistent local memory for OpenCode that keeps compact context, session continuity, and vault knowledge current.",
   "type": "module",
   "license": "MIT",

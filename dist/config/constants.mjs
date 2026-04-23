@@ -13,11 +13,12 @@ export const DEFAULT_DB_CANDIDATES = [
   path.join(os.homedir(), ".local", "share", "opencode", "opencode.db"),
   path.join(os.homedir(), "Library", "Application Support", "opencode", "opencode.db"),
 ];
-export const MAINTENANCE_INTERVAL_MS = 60_000;
-export const VAULT_SCAN_INTERVAL_MS = 120_000;
+export const MAINTENANCE_INTERVAL_MS = 300_000;
+export const VAULT_SCAN_INTERVAL_MS = 300_000;
 export const DEFAULT_BACKUP_INTERVAL_MS = 12 * 60 * 60 * 1000;
 export const DEFAULT_BACKUP_RETENTION_COUNT = 14;
-export const WATCH_DEBOUNCE_MS = 750;
+export const WATCH_DEBOUNCE_MS = 3_000;
+export const WATCH_COOLDOWN_MS = 30_000;
 export const MAX_RECENT_SESSIONS = 8;
 export const MAX_RECENT_KNOWLEDGE = 5;
 export const OVERVIEW_CONTEXT_LIMIT = 3_500;
@@ -34,13 +35,13 @@ export const BACKUP_SCOPE_DEFINITIONS = [
     key: "opencodeConfig",
     directoryName: "opencode-config",
     label: "OpenCode config",
-    excludedPrefixes: ["node_modules", "memory/logs", "memory/dropbox/processed", "memory/dropbox/failed"],
+    excludedPrefixes: ["node_modules", "profiles", "memory/logs", "memory/dropbox/processed", "memory/dropbox/failed"],
   },
   {
     key: "opencodeState",
     directoryName: "opencode-state",
     label: "OpenCode runtime state",
-    excludedPrefixes: ["bin", "log", "tool-output", "worktree"],
+    excludedPrefixes: ["bin", "log", "tool-output", "worktree", "storage", "snapshot"],
   },
 ];
 

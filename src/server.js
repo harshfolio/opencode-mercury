@@ -1,6 +1,7 @@
 import { promises as fs, watch as watchFs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { tool } from "@opencode-ai/plugin";
 import {
   ACTIVE_CONTEXT_LIMIT,
@@ -9,13 +10,13 @@ import {
   DEFAULT_BACKUP_INTERVAL_MS,
   DEFAULT_BACKUP_RETENTION_COUNT,
   DEFAULT_BASELINE,
+  DEFAULT_BACKUP_ROOT,
   DEFAULT_DB_CANDIDATES,
   DEFAULT_MEMORY_ROOT,
   DEFAULT_OPENCODE_CONFIG_ROOT,
   DEFAULT_PRIORITIES,
   DEFAULT_REMINDERS,
   DEFAULT_VAULT_ROOT,
-  DEFAULT_BACKUP_ROOT,
   INSTALL_STATE,
   MAINTENANCE_INTERVAL_MS,
   MAX_RECENT_KNOWLEDGE,
@@ -26,6 +27,7 @@ import {
   SENSITIVE_PATTERNS,
   SUPPORTED_NOTE_SUFFIXES,
   VAULT_SCAN_INTERVAL_MS,
+  WATCH_COOLDOWN_MS,
   WATCH_DEBOUNCE_MS,
   WORKSTREAM_RULES,
 } from "./config/constants.mjs";
@@ -33,7 +35,9 @@ import {
 export const id = "@harshfolio/opencode-mercury";
 
 const maintenanceControllers = new Map();
+const maintenanceChains = new Map();
 let sqliteDriverPromise = null;
+const MAX_METRIC_RUNS = 20;
 const fileReadCaches = {
   ledger: { path: "", mtimeMs: 0, size: 0, value: [] },
   knowledgeIndex: { path: "", mtimeMs: 0, size: 0, value: { version: 1, updated: "", files: {} }, readError: false },
@@ -445,6 +449,15 @@ async function writeText(target, content) {
   invalidateDerivedCachesForPath(target);
 }
 
+async function writeTextIfChanged(target, content) {
+  try {
+    const existing = await fs.readFile(target, "utf8");
+    if (existing === content) return false;
+  } catch {}
+  await writeText(target, content);
+  return true;
+}
+
 async function ensureFile(target, content, force = false) {
   if (!force && await exists(target)) return false;
   await writeText(target, content);
@@ -513,6 +526,18 @@ function maintenanceControllerKey(paths) {
   return `${paths.vaultPath}::${paths.memoryPath}`;
 }
 
+async function runSerializedMaintenance(paths, operation) {
+  const key = maintenanceControllerKey(paths);
+  const previous = maintenanceChains.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(operation);
+  maintenanceChains.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (maintenanceChains.get(key) === current) maintenanceChains.delete(key);
+  }
+}
+
 function firstDefinedPath(...values) {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return expandPath(value.trim());
@@ -531,7 +556,7 @@ function parsePositiveInteger(value, fallback) {
 }
 
 function snapshotTimestamp() {
-  return nowIso().replace(/:/g, "-");
+  return `${nowIso().replace(/:/g, "-")}-${String(Date.now() % 1000).padStart(3, "0")}`;
 }
 
 function normalizeBackupRecord(record = {}) {
@@ -738,9 +763,30 @@ function renderStateSeed() {
     lastMaintenanceAt: "",
     lastMaintenanceMs: 0,
     lastSessionSyncMs: 0,
+    lastOpenCodePollMs: 0,
+    lastOpenCodeLedgerCursor: { updatedMs: 0, sessionID: "" },
+    lastOpenCodeCorrectionCursor: { updatedMs: 0, sessionID: "" },
     lastVaultScanAt: "",
     lastVaultScanMs: 0,
+    lastDerivedFingerprint: "",
+    lastAgentsFingerprint: "",
+    metrics: {
+      lastRuns: [],
+    },
   }, null, 2)}\n`;
+}
+
+function normalizeMetrics(metrics) {
+  return {
+    lastRuns: Array.isArray(metrics?.lastRuns) ? metrics.lastRuns.slice(-MAX_METRIC_RUNS) : [],
+  };
+}
+
+function normalizeOpenCodeCursor(cursor) {
+  return {
+    updatedMs: Number(cursor?.updatedMs || 0),
+    sessionID: String(cursor?.sessionID || ""),
+  };
 }
 
 async function ensureScaffold(paths, options = {}, force = false) {
@@ -799,8 +845,14 @@ async function readPluginState(paths) {
     lastMaintenanceAt: String(state.lastMaintenanceAt || ""),
     lastMaintenanceMs: Number(state.lastMaintenanceMs || 0),
     lastSessionSyncMs: Number(state.lastSessionSyncMs || 0),
+    lastOpenCodePollMs: Number(state.lastOpenCodePollMs || 0),
+    lastOpenCodeLedgerCursor: normalizeOpenCodeCursor(state.lastOpenCodeLedgerCursor),
+    lastOpenCodeCorrectionCursor: normalizeOpenCodeCursor(state.lastOpenCodeCorrectionCursor),
     lastVaultScanAt: String(state.lastVaultScanAt || ""),
     lastVaultScanMs: Number(state.lastVaultScanMs || 0),
+    lastDerivedFingerprint: String(state.lastDerivedFingerprint || ""),
+    lastAgentsFingerprint: String(state.lastAgentsFingerprint || ""),
+    metrics: normalizeMetrics(state.metrics),
     readError,
   };
 }
@@ -823,9 +875,49 @@ async function writePluginState(paths, state) {
     lastMaintenanceAt: state.lastMaintenanceAt || "",
     lastMaintenanceMs: Number(state.lastMaintenanceMs || 0),
     lastSessionSyncMs: Number(state.lastSessionSyncMs || 0),
+    lastOpenCodePollMs: Number(state.lastOpenCodePollMs || 0),
+    lastOpenCodeLedgerCursor: normalizeOpenCodeCursor(state.lastOpenCodeLedgerCursor),
+    lastOpenCodeCorrectionCursor: normalizeOpenCodeCursor(state.lastOpenCodeCorrectionCursor),
     lastVaultScanAt: state.lastVaultScanAt || "",
     lastVaultScanMs: Number(state.lastVaultScanMs || 0),
+    lastDerivedFingerprint: state.lastDerivedFingerprint || "",
+    lastAgentsFingerprint: state.lastAgentsFingerprint || "",
+    metrics: normalizeMetrics(state.metrics),
   });
+}
+
+function metricDurationMs(startMs) {
+  return Number((performance.now() - startMs).toFixed(1));
+}
+
+function rememberMaintenanceMetrics(state, run) {
+  const metrics = normalizeMetrics(state.metrics);
+  metrics.lastRuns.push(run);
+  metrics.lastRuns = metrics.lastRuns.slice(-MAX_METRIC_RUNS);
+  state.metrics = metrics;
+}
+
+function fingerprintFromStats(statsMap) {
+  return Object.entries(statsMap)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}:${value?.mtimeMs || 0}:${value?.size || 0}`)
+    .join("|");
+}
+
+async function computeDerivedFingerprint(paths) {
+  const [ledger, knowledgeIndex, currentPriorities, userProfile, vaultAgentContext] = await Promise.all([
+    readFileStats(paths.ledger),
+    readFileStats(paths.knowledgeIndex),
+    readFileStats(paths.currentPriorities),
+    readFileStats(paths.userProfile),
+    readFileStats(paths.vaultAgentContext),
+  ]);
+  return fingerprintFromStats({ ledger, knowledgeIndex, currentPriorities, userProfile, vaultAgentContext });
+}
+
+async function computeAgentsFingerprint(paths) {
+  const userProfile = await readFileStats(paths.userProfile);
+  return fingerprintFromStats({ userProfile });
 }
 
 async function readKnowledgeIndex(paths) {
@@ -1033,6 +1125,20 @@ async function parseLedger(paths) {
   return entries;
 }
 
+function latestLedgerEntries(entries) {
+  const latestBySession = new Map();
+  for (const entry of entries) {
+    const sessionID = String(entry?.session_id || "");
+    if (!sessionID) continue;
+    const current = latestBySession.get(sessionID);
+    if (!current || Number(entry.updated_ms || 0) >= Number(current.updated_ms || 0)) {
+      latestBySession.set(sessionID, entry);
+    }
+  }
+  return Array.from(latestBySession.values())
+    .sort((left, right) => Number(right.updated_ms || 0) - Number(left.updated_ms || 0));
+}
+
 async function countJsonLines(target) {
   const raw = await readText(target, "");
   return raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length;
@@ -1043,7 +1149,7 @@ async function appendLedgerEntry(paths, entry) {
 }
 
 async function existingLedgerIds(paths) {
-  const entries = await parseLedger(paths);
+  const entries = latestLedgerEntries(await parseLedger(paths));
   return new Set(entries.map((entry) => entry.session_id).filter(Boolean));
 }
 
@@ -1168,12 +1274,16 @@ ${(stablePreferences.length ? stablePreferences : ["- No stable preferences capt
 `;
 }
 
-async function syncGlobalAgents(paths) {
+async function syncGlobalAgents(paths, state) {
+  const fingerprint = await computeAgentsFingerprint(paths);
+  if (state && state.lastAgentsFingerprint === fingerprint) return false;
   const existing = await readText(paths.opencodeAgents, "");
   if (existing.trim() && !isMercuryManagedAgents(existing) && !await exists(paths.opencodeAgentsBackup)) {
     await writeText(paths.opencodeAgentsBackup, existing.endsWith("\n") ? existing : `${existing}\n`);
   }
-  await writeText(paths.opencodeAgents, await renderGlobalAgents(paths));
+  const changed = await writeTextIfChanged(paths.opencodeAgents, await renderGlobalAgents(paths));
+  if (state) state.lastAgentsFingerprint = fingerprint;
+  return changed;
 }
 
 async function connectDb(dbPath) {
@@ -1188,119 +1298,187 @@ function queryAll(db, sql, ...params) {
   return db.driver.queryAll(db.handle, sql, ...params);
 }
 
-function messageText(db, messageID) {
-  const parts = queryAll(db, "SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC", messageID);
-  return parts
-    .map((partRow) => safeJsonParse(partRow.data, null))
-    .filter((part) => part && part.type === "text")
-    .map((part) => stripFences(part.text || ""))
-    .filter(Boolean)
-    .join("\n")
-    .trim();
+function sessionCursorFromRow(row) {
+  return {
+    updatedMs: Number(row?.time_updated || 0),
+    sessionID: String(row?.id || ""),
+  };
 }
 
-function firstUserPrompt(db, sessionID) {
-  const messages = queryAll(db, "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC", sessionID);
-  for (const row of messages) {
-    const message = safeJsonParse(row.data, null);
-    if (!message || message.role !== "user") continue;
-    const text = messageText(db, row.id);
-    if (!text) continue;
-    const firstLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-    if (firstLine) return truncate(firstLine, 120);
+function compareSessionCursor(left, right) {
+  if (Number(left?.updatedMs || 0) !== Number(right?.updatedMs || 0)) {
+    return Number(left?.updatedMs || 0) - Number(right?.updatedMs || 0);
   }
-  return "";
+  return String(left?.sessionID || "").localeCompare(String(right?.sessionID || ""));
 }
 
-function firstAssistantOutcome(db, sessionID, fallback) {
-  const messages = queryAll(db, "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC", sessionID);
-  for (const row of messages) {
-    const message = safeJsonParse(row.data, null);
-    if (!message || message.role !== "assistant") continue;
-    const text = messageText(db, row.id);
-    if (!text || isNoise(text)) continue;
-    const summary = extractNoteSummary(text, fallback);
-    if (summary) return truncate(summary, 180);
+function maxSessionCursor(...cursors) {
+  return cursors.reduce((best, cursor) => (compareSessionCursor(cursor, best) > 0 ? cursor : best), { updatedMs: 0, sessionID: "" });
+}
+
+function sessionPageQuery(direction, includeCursor = false) {
+  const comparator = direction === "desc" ? "<" : ">";
+  const order = direction === "desc" ? "DESC" : "ASC";
+  if (!includeCursor) {
+    return `SELECT id, title, directory, time_updated FROM session ORDER BY time_updated ${order}, id ${order} LIMIT ?`;
   }
-  return "";
+  return `SELECT id, title, directory, time_updated FROM session WHERE time_updated ${comparator} ? OR (time_updated = ? AND id ${comparator} ?) ORDER BY time_updated ${order}, id ${order} LIMIT ?`;
 }
 
-async function buildSessionSummariesFromDb(paths, limit = MAX_RECENT_SESSIONS) {
+function loadSessionRows(db, cursor, limit, direction = "asc") {
+  const normalized = normalizeOpenCodeCursor(cursor);
+  const includeCursor = Boolean(normalized.updatedMs || normalized.sessionID);
+  return includeCursor
+    ? queryAll(db, sessionPageQuery(direction, true), normalized.updatedMs, normalized.updatedMs, normalized.sessionID, limit)
+    : queryAll(db, sessionPageQuery(direction, false), limit);
+}
+
+function loadMessagesForSessions(db, sessionIDs) {
+  if (!sessionIDs.length) return [];
+  const placeholders = sessionIDs.map(() => "?").join(", ");
+  return queryAll(
+    db,
+    `SELECT id, session_id, time_created, data FROM message WHERE session_id IN (${placeholders}) ORDER BY session_id ASC, time_created ASC, id ASC`,
+    ...sessionIDs,
+  );
+}
+
+function loadPartsForMessages(db, messageIDs) {
+  if (!messageIDs.length) return [];
+  const rows = [];
+  for (let index = 0; index < messageIDs.length; index += 250) {
+    const batch = messageIDs.slice(index, index + 250);
+    const placeholders = batch.map(() => "?").join(", ");
+    rows.push(...queryAll(
+      db,
+      `SELECT id, message_id, time_created, data FROM part WHERE message_id IN (${placeholders}) ORDER BY message_id ASC, id ASC`,
+      ...batch,
+    ));
+  }
+  return rows;
+}
+
+function hydrateSessionArtifacts(sessionRows, messageRows, partRows, existingCorrections = null) {
+  const partsByMessage = new Map();
+  for (const row of partRows) {
+    const entries = partsByMessage.get(row.message_id) || [];
+    entries.push(row);
+    partsByMessage.set(row.message_id, entries);
+  }
+
+  const textByMessage = new Map();
+  for (const [messageID, rows] of partsByMessage.entries()) {
+    const text = rows
+      .map((partRow) => ({
+        timeCreated: Number(partRow.time_created || 0),
+        id: String(partRow.id || ""),
+        part: safeJsonParse(partRow.data, null),
+      }))
+      .sort((left, right) => left.timeCreated - right.timeCreated || left.id.localeCompare(right.id))
+      .map((entry) => entry.part)
+      .filter((part) => part && part.type === "text")
+      .map((part) => stripFences(part.text || ""))
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+    textByMessage.set(messageID, text);
+  }
+
+  const messagesBySession = new Map();
+  for (const row of messageRows) {
+    const entries = messagesBySession.get(row.session_id) || [];
+    const message = safeJsonParse(row.data, null);
+    entries.push({
+      id: String(row.id || ""),
+      role: message?.role || "",
+      text: textByMessage.get(row.id) || "",
+    });
+    messagesBySession.set(row.session_id, entries);
+  }
+
+  const summaries = [];
+  const corrections = [];
+  for (const row of sessionRows) {
+    const messages = messagesBySession.get(row.id) || [];
+    const project = path.basename(row.directory || "global") || "global";
+    const promptExcerpt = messages
+      .filter((message) => message.role === "user")
+      .map((message) => message.text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "")
+      .find(Boolean) || "";
+    let title = row.title || promptExcerpt || project;
+    if (String(title).startsWith("New session -") && promptExcerpt) title = promptExcerpt;
+    const assistantSummary = messages
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.text)
+      .find((text) => text && !isNoise(text));
+    const summary = assistantSummary ? extractNoteSummary(assistantSummary, title) : "";
+    summaries.push({
+      session_id: row.id,
+      updated: isoFromMs(row.time_updated),
+      updated_ms: row.time_updated,
+      project,
+      directory: row.directory || "",
+      title: truncate(title, 100),
+      prompt_excerpt: truncate(promptExcerpt, 120),
+      summary: truncate(summary || promptExcerpt || title, 180),
+    });
+    if (!existingCorrections) continue;
+    for (const message of messages) {
+      if (message.role !== "user" || !message.text) continue;
+      for (const rawLine of String(message.text || "").split(/\r?\n/)) {
+        const line = truncate(rawLine, 220);
+        if (line.length < 12) continue;
+        if (!CORRECTION_PATTERNS.some((pattern) => pattern.test(line))) continue;
+        if (existingCorrections.has(line)) continue;
+        corrections.push({
+          ts: nowIso(),
+          scope: "session-correction",
+          project,
+          correction: line,
+          source: `opencode-session:${row.id}`,
+          confidence: 0.65,
+        });
+        existingCorrections.add(line);
+      }
+    }
+  }
+
+  return { summaries, corrections };
+}
+
+function loadSessionArtifacts(db, sessionRows, existingCorrections = null) {
+  if (!sessionRows.length) return { summaries: [], corrections: [] };
+  const sessionIDs = sessionRows.map((row) => row.id);
+  const messageRows = loadMessagesForSessions(db, sessionIDs);
+  const messageIDs = messageRows.map((row) => row.id);
+  const partRows = loadPartsForMessages(db, messageIDs);
+  return hydrateSessionArtifacts(sessionRows, messageRows, partRows, existingCorrections);
+}
+
+async function buildRecentSessionSummariesFromDb(paths, limit = MAX_RECENT_SESSIONS) {
   if (!await exists(paths.opencodeDbPath)) return [];
   let db;
   try {
     db = await connectDb(paths.opencodeDbPath);
-    const rows = queryAll(db, "SELECT id, title, directory, time_updated FROM session ORDER BY time_updated DESC LIMIT ?", limit);
-    return rows.map((row) => {
-      const promptExcerpt = firstUserPrompt(db, row.id);
-      const project = path.basename(row.directory || "global") || "global";
-      let title = row.title || promptExcerpt || project;
-      if (String(title).startsWith("New session -") && promptExcerpt) title = promptExcerpt;
-      const summary = firstAssistantOutcome(db, row.id, title) || promptExcerpt || title;
-      return {
-        session_id: row.id,
-        updated: isoFromMs(row.time_updated),
-        updated_ms: row.time_updated,
-        project,
-        directory: row.directory || "",
-        title: truncate(title, 100),
-        prompt_excerpt: promptExcerpt,
-        summary: truncate(summary, 180),
-      };
-    });
+    const rows = loadSessionRows(db, null, limit, "desc");
+    return loadSessionArtifacts(db, rows).summaries;
   } finally {
     db?.driver.close(db.handle);
   }
 }
 
-async function appendSessionLedgerEntries(paths, summaries, sinceMs) {
-  const seen = await existingLedgerIds(paths);
-  const additions = summaries.filter((summary) => !seen.has(summary.session_id) && summary.updated_ms > sinceMs);
+async function appendSessionLedgerEntries(paths, summaries) {
+  const latestEntries = new Map(latestLedgerEntries(await parseLedger(paths)).map((entry) => [entry.session_id, entry]));
+  const additions = summaries.filter((summary) => {
+    const current = latestEntries.get(summary.session_id);
+    if (!current) return true;
+    return Number(summary.updated_ms || 0) > Number(current.updated_ms || 0)
+      || String(summary.summary || "") !== String(current.summary || "")
+      || String(summary.title || "") !== String(current.title || "");
+  });
   if (!additions.length) return 0;
   await appendText(paths.ledger, `${additions.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
   return additions.length;
-}
-
-async function extractCorrectionCandidates(paths, sinceMs) {
-  if (!await exists(paths.opencodeDbPath)) return [];
-  const existing = await readExistingCorrections(paths);
-  let db;
-  try {
-    db = await connectDb(paths.opencodeDbPath);
-    const sessionRows = queryAll(db, "SELECT id, directory FROM session WHERE time_updated > ? ORDER BY time_updated DESC LIMIT 20", sinceMs);
-    const entries = [];
-    for (const sessionRow of sessionRows) {
-      const project = path.basename(sessionRow.directory || "global") || "global";
-      const messageRows = queryAll(db, "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC", sessionRow.id);
-      for (const messageRow of messageRows) {
-        const message = safeJsonParse(messageRow.data, null);
-        if (!message || message.role !== "user") continue;
-        const partRows = queryAll(db, "SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC", messageRow.id);
-        for (const partRow of partRows) {
-          const part = safeJsonParse(partRow.data, null);
-          if (!part || part.type !== "text") continue;
-          for (const rawLine of String(part.text || "").split(/\r?\n/)) {
-            const line = truncate(rawLine, 220);
-            if (line.length < 12) continue;
-            if (!CORRECTION_PATTERNS.some((pattern) => pattern.test(line))) continue;
-            if (existing.has(line)) continue;
-            entries.push({
-              ts: nowIso(),
-              scope: "session-correction",
-              project,
-              correction: line,
-              source: `opencode-session:${sessionRow.id}`,
-              confidence: 0.65,
-            });
-            existing.add(line);
-          }
-        }
-      }
-    }
-    return entries;
-  } finally {
-    db?.driver.close(db.handle);
-  }
 }
 
 async function updateSessionState(paths, state, sessionInfo) {
@@ -1360,35 +1538,37 @@ async function listSupportedFiles(root) {
   return results.sort((left, right) => left.localeCompare(right));
 }
 
-function shouldIgnoreVaultFile(relativePath) {
+function normalizeKnowledgeRelativePath(relativePath) {
   const normalized = normalizeRelativePath(relativePath);
-  const base = path.basename(normalized);
-  if (["Vault Home.md", "AGENTS.md", "_Index.md"].includes(base)) return true;
-  if (normalized.startsWith("_agent/")) return true;
-  return false;
+  if (!normalized) return "";
+  if (normalized === ".") return "";
+  return normalized;
 }
 
-function summarizeKnowledgeFile(rawContent, relativePath, stats) {
-  const fallbackTitle = path.basename(relativePath, path.extname(relativePath)).replace(/[-_]+/g, " ");
-  const title = extractNoteTitle(rawContent, fallbackTitle);
-  const summary = extractNoteSummary(rawContent, title);
-  const bullets = extractNoteBullets(rawContent, 3);
-  const zone = zoneLabelForRelativePath(relativePath);
-  const evidence = `${relativePath} ${title} ${summary} ${bullets.join(" ")}`;
-  return {
-    relativePath,
-    title,
-    summary,
-    bullets,
-    zone,
-    size: stats.size,
-    mtimeMs: stats.mtimeMs,
-    updated: isoFromMs(stats.mtimeMs),
-    workstream: classifyWorkstream(evidence),
-  };
+async function syncKnowledgeEntryAtPath(paths, index, relativePath, force = false) {
+  const normalized = normalizeKnowledgeRelativePath(relativePath);
+  if (!normalized || shouldIgnoreVaultFile(normalized)) return { scanned: 0, added: 0, updated: 0, removed: 0, changed: false };
+  const fullPath = path.join(paths.vaultPath, normalized);
+  const stats = await readFileStats(fullPath);
+  if (!stats || !stats.isFile() || !SUPPORTED_NOTE_SUFFIXES.has(path.extname(normalized).toLowerCase())) {
+    const subtreePrefix = `${normalized}/`;
+    const removedKeys = Object.keys(index.files).filter((key) => key === normalized || key.startsWith(subtreePrefix));
+    if (removedKeys.length) {
+      for (const key of removedKeys) delete index.files[key];
+      return { scanned: 1, added: 0, updated: 0, removed: removedKeys.length, changed: true };
+    }
+    return { scanned: 1, added: 0, updated: 0, removed: 0, changed: false };
+  }
+  const previous = index.files[normalized];
+  if (!force && previous && previous.mtimeMs === stats.mtimeMs && previous.size === stats.size) {
+    return { scanned: 1, added: 0, updated: 0, removed: 0, changed: false };
+  }
+  const rawContent = await readText(fullPath, "");
+  index.files[normalized] = summarizeKnowledgeFile(rawContent, normalized, stats);
+  return { scanned: 1, added: previous ? 0 : 1, updated: previous ? 1 : 0, removed: 0, changed: true };
 }
 
-async function syncKnowledgeIndex(paths, state, force = false) {
+async function syncKnowledgeIndexFull(paths, state, force = false) {
   const index = await readKnowledgeIndex(paths);
   const files = await listSupportedFiles(paths.vaultPath);
   const seen = new Set();
@@ -1396,7 +1576,7 @@ async function syncKnowledgeIndex(paths, state, force = false) {
   let updated = 0;
 
   for (const fullPath of files) {
-    const relativePath = normalizeRelativePath(path.relative(paths.vaultPath, fullPath));
+    const relativePath = normalizeKnowledgeRelativePath(path.relative(paths.vaultPath, fullPath));
     if (!relativePath || shouldIgnoreVaultFile(relativePath)) continue;
     seen.add(relativePath);
     const stats = await fs.stat(fullPath);
@@ -1429,6 +1609,82 @@ async function syncKnowledgeIndex(paths, state, force = false) {
   };
 }
 
+async function syncKnowledgeIndexDirty(paths, state, dirtyPaths, force = false) {
+  const uniquePaths = Array.from(new Set((dirtyPaths || []).map(normalizeKnowledgeRelativePath).filter(Boolean)));
+  if (!uniquePaths.length) {
+    const index = await readKnowledgeIndex(paths);
+    return {
+      scanned: 0,
+      indexed: Object.keys(index.files || {}).length,
+      added: 0,
+      updated: 0,
+      removed: 0,
+    };
+  }
+  const index = await readKnowledgeIndex(paths);
+  let scanned = 0;
+  let added = 0;
+  let updated = 0;
+  let removed = 0;
+  let changed = false;
+  for (const relativePath of uniquePaths) {
+    const result = await syncKnowledgeEntryAtPath(paths, index, relativePath, force);
+    scanned += result.scanned;
+    added += result.added;
+    updated += result.updated;
+    removed += result.removed;
+    changed = changed || result.changed;
+  }
+  if (changed || force) {
+    index.updated = nowIso();
+    state.lastVaultScanAt = index.updated;
+    state.lastVaultScanMs = Date.now();
+    await writeKnowledgeIndex(paths, index);
+  }
+  return {
+    scanned,
+    indexed: Object.keys(index.files || {}).length,
+    added,
+    updated,
+    removed,
+  };
+}
+
+function shouldIgnoreVaultFile(relativePath) {
+  const normalized = normalizeRelativePath(relativePath);
+  const base = path.basename(normalized);
+  if (["Vault Home.md", "AGENTS.md", "_Index.md"].includes(base)) return true;
+  if (normalized.startsWith("_agent/")) return true;
+  return false;
+}
+
+function summarizeKnowledgeFile(rawContent, relativePath, stats) {
+  const fallbackTitle = path.basename(relativePath, path.extname(relativePath)).replace(/[-_]+/g, " ");
+  const title = extractNoteTitle(rawContent, fallbackTitle);
+  const summary = extractNoteSummary(rawContent, title);
+  const bullets = extractNoteBullets(rawContent, 3);
+  const zone = zoneLabelForRelativePath(relativePath);
+  const evidence = `${relativePath} ${title} ${summary} ${bullets.join(" ")}`;
+  return {
+    relativePath,
+    title,
+    summary,
+    bullets,
+    zone,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+    updated: isoFromMs(stats.mtimeMs),
+    workstream: classifyWorkstream(evidence),
+  };
+}
+
+async function syncKnowledgeIndex(paths, state, { force = false, dirtyPaths = [], fullRescan = false } = {}) {
+  if (force || fullRescan || !dirtyPaths.length) {
+    return await syncKnowledgeIndexFull(paths, state, force);
+  }
+  return await syncKnowledgeIndexDirty(paths, state, dirtyPaths, force);
+}
+
 function recentKnowledgeEntries(index) {
   return Object.values(index.files || {})
     .sort((left, right) => Number(right.mtimeMs || 0) - Number(left.mtimeMs || 0))
@@ -1454,7 +1710,7 @@ async function buildDerivedMemory(paths) {
   const existing = await readExistingActiveContext(paths);
   const priorities = await readCurrentPriorities(paths);
   const vaultFocus = await readVaultFocus(paths);
-  const ledger = (await parseLedger(paths)).filter((entry) => !isNoise(`${entry.title || ""} ${entry.summary || ""} ${entry.prompt_excerpt || ""} ${entry.directory || ""}`));
+  const ledger = latestLedgerEntries(await parseLedger(paths)).filter((entry) => !isNoise(`${entry.title || ""} ${entry.summary || ""} ${entry.prompt_excerpt || ""} ${entry.directory || ""}`));
   const recentSessions = ledger.slice(0, 5);
   const knowledgeIndex = await readKnowledgeIndex(paths);
   const recentKnowledge = recentKnowledgeEntries(knowledgeIndex);
@@ -1546,12 +1802,16 @@ ${recentKnowledgeLines.slice(0, 3).join("\n")}
   return { activeContext, overview };
 }
 
-async function refreshDerivedFiles(paths) {
+async function refreshDerivedFiles(paths, state) {
+  const fingerprint = await computeDerivedFingerprint(paths);
+  if (state && state.lastDerivedFingerprint === fingerprint) return false;
   const derived = await buildDerivedMemory(paths);
-  await Promise.all([
-    writeText(paths.activeContext, derived.activeContext),
-    writeText(paths.overview, derived.overview),
+  const [activeChanged, overviewChanged] = await Promise.all([
+    writeTextIfChanged(paths.activeContext, derived.activeContext),
+    writeTextIfChanged(paths.overview, derived.overview),
   ]);
+  if (state) state.lastDerivedFingerprint = fingerprint;
+  return activeChanged || overviewChanged;
 }
 
 async function listPendingDropboxFiles(paths) {
@@ -1568,6 +1828,7 @@ async function ingestDropbox(paths) {
   if (!await exists(paths.dropbox)) return [];
   const items = await fs.readdir(paths.dropbox, { withFileTypes: true });
   const ingested = [];
+  const indexedPaths = [];
   const failed = [];
 
   for (const item of items) {
@@ -1610,7 +1871,8 @@ ${raw || "(empty file)"}
       await writeText(target, content);
       const destination = await uniqueTargetPath(path.join(paths.dropboxProcessed, item.name));
       await moveFile(fullPath, destination);
-        ingested.push(path.basename(target));
+      ingested.push(path.basename(target));
+      indexedPaths.push(normalizeKnowledgeRelativePath(path.relative(paths.vaultPath, target)));
     } catch (error) {
       const failedDestination = await uniqueTargetPath(path.join(paths.dropboxFailed, item.name));
       if (await exists(fullPath)) await moveFile(fullPath, failedDestination);
@@ -1621,7 +1883,7 @@ ${raw || "(empty file)"}
     }
   }
 
-  return { ingested, failed };
+  return { ingested, indexedPaths, failed };
 }
 
 function normalizeImportMode(mode) {
@@ -1698,18 +1960,51 @@ async function importKnowledge(paths, state, sourcePath, mode) {
   return { ...copyResult, knowledge };
 }
 
-async function syncOpenCodeActivity(paths, state) {
-  const summaries = await buildSessionSummariesFromDb(paths, MAX_RECENT_SESSIONS + 2);
-  const sinceMs = Number(state.lastSessionSyncMs || 0);
-  const ledgerEntriesAppended = await appendSessionLedgerEntries(paths, summaries, sinceMs);
-  const correctionsAppended = await appendCorrections(paths, await extractCorrectionCandidates(paths, sinceMs));
-  const latest = summaries.reduce((max, item) => Math.max(max, Number(item.updated_ms || 0)), sinceMs);
-  state.lastSessionSyncMs = latest;
+async function syncOpenCodeActivity(paths, state, { forceFull = false } = {}) {
+  const recentSummaries = await buildRecentSessionSummariesFromDb(paths, MAX_RECENT_SESSIONS + 2);
+  const existingCorrections = await readExistingCorrections(paths);
+  let ledgerEntriesAppended = 0;
+  let correctionsAppended = 0;
+  let ledgerCursor = normalizeOpenCodeCursor(state.lastOpenCodeLedgerCursor);
+  let correctionCursor = normalizeOpenCodeCursor(state.lastOpenCodeCorrectionCursor);
+  const pageSize = MAX_RECENT_SESSIONS + 24;
+  const maxPages = forceFull ? 1000 : 4;
+
+  if (await exists(paths.opencodeDbPath)) {
+    let db;
+    try {
+      db = await connectDb(paths.opencodeDbPath);
+      for (let page = 0; page < maxPages; page += 1) {
+        const ledgerRows = loadSessionRows(db, ledgerCursor, pageSize, "asc");
+        if (!ledgerRows.length) break;
+        const { summaries } = loadSessionArtifacts(db, ledgerRows);
+        ledgerEntriesAppended += await appendSessionLedgerEntries(paths, summaries);
+        ledgerCursor = sessionCursorFromRow(ledgerRows.at(-1));
+        if (ledgerRows.length < pageSize) break;
+      }
+
+      for (let page = 0; page < maxPages; page += 1) {
+        const correctionRows = loadSessionRows(db, correctionCursor, pageSize, "asc");
+        if (!correctionRows.length) break;
+        const { corrections } = loadSessionArtifacts(db, correctionRows, existingCorrections);
+        correctionsAppended += await appendCorrections(paths, corrections);
+        correctionCursor = sessionCursorFromRow(correctionRows.at(-1));
+        if (correctionRows.length < pageSize) break;
+      }
+    } finally {
+      db?.driver.close(db.handle);
+    }
+  }
+
+  state.lastOpenCodePollMs = Date.now();
+  state.lastOpenCodeLedgerCursor = ledgerCursor;
+  state.lastOpenCodeCorrectionCursor = correctionCursor;
+  state.lastSessionSyncMs = Math.max(Number(ledgerCursor.updatedMs || 0), Number(correctionCursor.updatedMs || 0));
   return {
-    sessionsSeen: summaries.length,
+    sessionsSeen: recentSummaries.length,
     ledgerEntriesAppended,
     correctionsAppended,
-    latestSessionAt: latest ? isoFromMs(latest) : "",
+    latestSessionAt: state.lastSessionSyncMs ? isoFromMs(state.lastSessionSyncMs) : "",
   };
 }
 
@@ -1743,6 +2038,9 @@ async function collectStatus(paths) {
     knowledgeIndexReadError: knowledgeIndex.readError,
     lastMaintenanceAt: state.lastMaintenanceAt || null,
     lastSessionSyncAt: state.lastSessionSyncMs ? isoFromMs(state.lastSessionSyncMs) : null,
+    lastOpenCodePollAt: state.lastOpenCodePollMs ? isoFromMs(state.lastOpenCodePollMs) : null,
+    lastOpenCodeLedgerCursor: state.lastOpenCodeLedgerCursor,
+    lastOpenCodeCorrectionCursor: state.lastOpenCodeCorrectionCursor,
     lastVaultScanAt: state.lastVaultScanAt || null,
     ledgerEntries: (await parseLedger(paths)).length,
     corrections: await countJsonLines(paths.corrections),
@@ -1750,6 +2048,7 @@ async function collectStatus(paths) {
     pendingDropboxFiles: await listPendingDropboxFiles(paths),
     imports: (state.imports || []).slice(-5),
     backups: state.backups,
+    maintenanceMetrics: state.metrics,
   };
 }
 
@@ -1763,53 +2062,97 @@ async function maintain(
     allowActivitySync = true,
     allowKnowledgeSync = true,
     allowDropboxIngest = true,
+    allowDerivedRefresh = true,
+    allowAgentSync = true,
     allowBackups = true,
+    includeStatus = false,
+    dirtyKnowledgePaths = [],
+    fullKnowledgeRescan = false,
   } = {},
 ) {
-  await ensureScaffold(paths, options, false);
-  const state = await readPluginState(paths);
-  const nowMs = Date.now();
+  return await runSerializedMaintenance(paths, async () => {
+    await ensureScaffold(paths, options, false);
+    const state = await readPluginState(paths);
+    const nowMs = Date.now();
+    const startedAt = performance.now();
+    const phaseTimings = {};
 
-  const dropbox = allowDropboxIngest ? await ingestDropbox(paths) : { ingested: [], failed: [] };
-  const sessionAdded = await updateSessionState(paths, state, sessionInfo);
+    const dropboxStart = performance.now();
+    const dropbox = allowDropboxIngest ? await ingestDropbox(paths) : { ingested: [], indexedPaths: [], failed: [] };
+    phaseTimings.dropboxMs = metricDurationMs(dropboxStart);
 
-  let activity = { sessionsSeen: 0, ledgerEntriesAppended: 0, correctionsAppended: 0, latestSessionAt: "" };
-  if (allowActivitySync && (force || !state.lastSessionSyncMs || nowMs - Number(state.lastSessionSyncMs || 0) >= MAINTENANCE_INTERVAL_MS)) {
-    activity = await syncOpenCodeActivity(paths, state);
-  }
+    const sessionStart = performance.now();
+    const sessionAdded = await updateSessionState(paths, state, sessionInfo);
+    phaseTimings.sessionStateMs = metricDurationMs(sessionStart);
 
-  let knowledge = { scanned: 0, indexed: 0, added: 0, updated: 0, removed: 0 };
-  if (
-    allowKnowledgeSync
-    && (
-    force
-    || !state.lastVaultScanMs
-    || nowMs - Number(state.lastVaultScanMs || 0) >= VAULT_SCAN_INTERVAL_MS
-    || Boolean(dropbox.ingested.length)
-    )
-  ) {
-    knowledge = await syncKnowledgeIndex(paths, state, force);
-  }
+    let activity = { sessionsSeen: 0, ledgerEntriesAppended: 0, correctionsAppended: 0, latestSessionAt: "" };
+    const activityStart = performance.now();
+    if (allowActivitySync && (force || !state.lastOpenCodePollMs || nowMs - Number(state.lastOpenCodePollMs || 0) >= MAINTENANCE_INTERVAL_MS)) {
+      activity = await syncOpenCodeActivity(paths, state, { forceFull: force });
+    }
+    phaseTimings.activitySyncMs = metricDurationMs(activityStart);
 
-  await refreshDerivedFiles(paths);
-  await syncGlobalAgents(paths);
+    let knowledge = { scanned: 0, indexed: 0, added: 0, updated: 0, removed: 0 };
+    const knowledgeStart = performance.now();
+    const pendingKnowledgePaths = Array.from(new Set([...(dirtyKnowledgePaths || []), ...(dropbox.indexedPaths || [])].map(normalizeKnowledgeRelativePath).filter(Boolean)));
+    if (
+      allowKnowledgeSync
+      && (
+        force
+        || fullKnowledgeRescan
+        || !state.lastVaultScanMs
+        || nowMs - Number(state.lastVaultScanMs || 0) >= VAULT_SCAN_INTERVAL_MS
+        || Boolean(pendingKnowledgePaths.length)
+      )
+    ) {
+      const knowledgeIntervalDue = !state.lastVaultScanMs || nowMs - Number(state.lastVaultScanMs || 0) >= VAULT_SCAN_INTERVAL_MS;
+      knowledge = await syncKnowledgeIndex(paths, state, {
+        force,
+        dirtyPaths: pendingKnowledgePaths,
+        fullRescan: force || fullKnowledgeRescan || knowledgeIntervalDue,
+      });
+    }
+    phaseTimings.knowledgeSyncMs = metricDurationMs(knowledgeStart);
 
-  const backups = allowBackups ? await runBackups(paths, state, { force, reason }) : [];
+    const derivedStart = performance.now();
+    const derivedChanged = allowDerivedRefresh ? await refreshDerivedFiles(paths, state) : false;
+    phaseTimings.derivedRefreshMs = metricDurationMs(derivedStart);
 
-  state.lastMaintenanceAt = nowIso();
-  state.lastMaintenanceMs = nowMs;
-  await writePluginState(paths, state);
+    const agentsStart = performance.now();
+    const agentsChanged = allowAgentSync ? await syncGlobalAgents(paths, state) : false;
+    phaseTimings.agentSyncMs = metricDurationMs(agentsStart);
 
-  return {
-    reason,
-    sessionAdded,
-    dropboxIngested: dropbox.ingested,
-    dropboxFailed: dropbox.failed,
-    activity,
-    knowledge,
-    backups,
-    status: await collectStatus(paths),
-  };
+    const backupStart = performance.now();
+    const backups = allowBackups ? await runBackups(paths, state, { force, reason }) : [];
+    phaseTimings.backupMs = metricDurationMs(backupStart);
+
+    state.lastMaintenanceAt = nowIso();
+    state.lastMaintenanceMs = nowMs;
+    rememberMaintenanceMetrics(state, {
+      at: state.lastMaintenanceAt,
+      reason,
+      sessionAdded,
+      derivedChanged,
+      agentsChanged,
+      timings: {
+        ...phaseTimings,
+        totalMs: metricDurationMs(startedAt),
+      },
+    });
+    await writePluginState(paths, state);
+
+    return {
+      reason,
+      sessionAdded,
+      dropboxIngested: dropbox.ingested,
+      dropboxFailed: dropbox.failed,
+      activity,
+      knowledge,
+      backups,
+      timings: state.metrics.lastRuns.at(-1)?.timings || phaseTimings,
+      status: includeStatus ? await collectStatus(paths) : null,
+    };
+  });
 }
 
 function buildSystemContext(overview, activeContext) {
@@ -1848,7 +2191,17 @@ function scheduleControllerRun(controller, reason, delay = WATCH_DEBOUNCE_MS) {
 
 function attachWatch(controller, target, options, reason) {
   try {
-    const watcher = watchFs(target, options, () => {
+    const watcher = watchFs(target, options, (_eventType, filename) => {
+      if (reason === "vault-watch") {
+        const relativePath = normalizeKnowledgeRelativePath(filename ? String(filename) : "");
+        if (relativePath && SUPPORTED_NOTE_SUFFIXES.has(path.extname(relativePath).toLowerCase())) controller.pendingKnowledgePaths.add(relativePath);
+        else controller.fullKnowledgeRescanRequired = true;
+      }
+      const lastWatchMs = Number(controller.lastWatchRunMs || 0);
+      if (lastWatchMs && Date.now() - lastWatchMs < WATCH_COOLDOWN_MS) {
+        scheduleControllerRun(controller, reason, Math.max(250, WATCH_COOLDOWN_MS - (Date.now() - lastWatchMs)));
+        return;
+      }
       scheduleControllerRun(controller, reason);
     });
     watcher.unref?.();
@@ -1908,8 +2261,11 @@ async function ensureMaintenanceController(paths, options) {
     watchedPaths: [],
     running: false,
     shutdown: false,
+    pendingKnowledgePaths: new Set(),
+    fullKnowledgeRescanRequired: false,
     lastBackgroundTickAt: "",
     lastBackgroundReason: "",
+    lastWatchRunMs: 0,
     async run(reason) {
       if (controller.shutdown) return;
       if (controller.running) {
@@ -1918,15 +2274,24 @@ async function ensureMaintenanceController(paths, options) {
       }
       controller.running = true;
       try {
+        const dirtyKnowledgePaths = Array.from(controller.pendingKnowledgePaths);
+        controller.pendingKnowledgePaths.clear();
+        const fullKnowledgeRescan = controller.fullKnowledgeRescanRequired;
+        controller.fullKnowledgeRescanRequired = false;
         const result = await maintain(controller.paths, null, controller.options, {
           force: false,
           reason,
           allowActivitySync: true,
           allowKnowledgeSync: true,
           allowDropboxIngest: true,
+          dirtyKnowledgePaths,
+          fullKnowledgeRescan,
         });
-        controller.lastBackgroundTickAt = result.status.lastMaintenanceAt || nowIso();
+        controller.lastBackgroundTickAt = result.status?.lastMaintenanceAt || nowIso();
         controller.lastBackgroundReason = reason;
+        if (reason === "dropbox-watch" || reason === "vault-watch") {
+          controller.lastWatchRunMs = Date.now();
+        }
       } catch (error) {
         await appendErrorLog(controller.paths, `background:${reason}`, error);
       } finally {
@@ -1988,7 +2353,8 @@ export async function server(input, options = {}) {
             userDisplayName: config.userDisplayName || options.userDisplayName || "",
             primaryWork: config.primaryWork || options.primaryWork || "",
           });
-          const result = await maintain(paths, null, config, { force: true, reason: "bootstrap" });
+          await ensureMaintenanceController(paths, config);
+          const result = await maintain(paths, null, config, { force: true, reason: "bootstrap", includeStatus: true });
           context.metadata({ title: "Bootstrapped Mercury PKM", metadata: { vaultPath: paths.vaultPath, memoryPath: paths.memoryPath, backupRoot: paths.backupRoot } });
           return JSON.stringify({
             message: "Bootstrapped Mercury PKM system",
@@ -2007,6 +2373,7 @@ export async function server(input, options = {}) {
         async execute(_args, context) {
           const paths = await buildPaths(input, options);
           await ensureScaffold(paths, options, false);
+          await ensureMaintenanceController(paths, options);
           const status = await collectStatus(paths);
           context.metadata({ title: "Mercury PKM status", metadata: { indexedKnowledgeFiles: status.indexedKnowledgeFiles } });
           return JSON.stringify(status, null, 2);
@@ -2017,7 +2384,7 @@ export async function server(input, options = {}) {
         args: {},
         async execute(_args, context) {
           const paths = await buildPaths(input, options);
-          const result = await maintain(paths, null, options, { force: true, reason: "manual-refresh" });
+          const result = await maintain(paths, null, options, { force: true, reason: "manual-refresh", includeStatus: true });
           context.metadata({ title: "Refreshed Mercury PKM", metadata: { indexedKnowledgeFiles: result.status.indexedKnowledgeFiles } });
           return JSON.stringify(result, null, 2);
         },
@@ -2027,13 +2394,15 @@ export async function server(input, options = {}) {
         args: {},
         async execute(_args, context) {
           const paths = await buildPaths(input, options);
-          await ensureScaffold(paths, options, false);
-          const state = await readPluginState(paths);
-          const backups = await runBackups(paths, state, { force: true, reason: "manual-backup" });
-          state.lastMaintenanceAt = nowIso();
-          state.lastMaintenanceMs = Date.now();
-          await writePluginState(paths, state);
-          const status = await collectStatus(paths);
+          const { backups, status } = await runSerializedMaintenance(paths, async () => {
+            await ensureScaffold(paths, options, false);
+            const state = await readPluginState(paths);
+            const backups = await runBackups(paths, state, { force: true, reason: "manual-backup" });
+            state.lastMaintenanceAt = nowIso();
+            state.lastMaintenanceMs = Date.now();
+            await writePluginState(paths, state);
+            return { backups, status: await collectStatus(paths) };
+          });
           context.metadata({ title: "Backed up Mercury world", metadata: { backupRoot: paths.backupRoot } });
           return JSON.stringify({ backupRoot: paths.backupRoot, backups, status }, null, 2);
         },
@@ -2047,21 +2416,24 @@ export async function server(input, options = {}) {
         async execute(args, context) {
           const config = { ...options, ...args };
           const paths = await buildPaths(input, options, args);
-          await ensureScaffold(paths, config, false);
-          const state = await readPluginState(paths);
-          const result = await importKnowledge(paths, state, args.sourcePath, args.mode);
-          const backups = await runBackups(paths, state, { force: false, reason: "import-knowledge" });
-          state.lastMaintenanceAt = nowIso();
-          state.lastMaintenanceMs = Date.now();
-          await writePluginState(paths, state);
-          await refreshDerivedFiles(paths);
+          const { result, backups, status } = await runSerializedMaintenance(paths, async () => {
+            await ensureScaffold(paths, config, false);
+            const state = await readPluginState(paths);
+            const result = await importKnowledge(paths, state, args.sourcePath, args.mode);
+            const backups = await runBackups(paths, state, { force: false, reason: "import-knowledge" });
+            state.lastMaintenanceAt = nowIso();
+            state.lastMaintenanceMs = Date.now();
+            await writePluginState(paths, state);
+            await refreshDerivedFiles(paths, state);
+            return { result, backups, status: await collectStatus(paths) };
+          });
           context.metadata({ title: "Imported knowledge into Mercury", metadata: { sourcePath: args.sourcePath, indexed: result.knowledge.indexed } });
           return JSON.stringify({
             sourcePath: expandPath(args.sourcePath),
             mode: normalizeImportMode(args.mode),
             result,
             backups,
-            status: await collectStatus(paths),
+            status,
           }, null, 2);
         },
       }),
@@ -2090,7 +2462,7 @@ confidence: 0.85
 ${args.noteText.trim()}
 `;
           await writeText(target, content);
-          const result = await maintain(paths, null, options, { force: true, reason: "ingest-note" });
+          const result = await maintain(paths, null, options, { force: true, reason: "ingest-note", includeStatus: true });
           context.metadata({ title: "Ingested note into Mercury", metadata: { file: target } });
           return JSON.stringify({ file: target, result }, null, 2);
         },
@@ -2103,15 +2475,17 @@ ${args.noteText.trim()}
         },
         async execute(args, context) {
           const paths = await buildPaths(input, options);
-          await ensureScaffold(paths, options, false);
-          await rememberProfileFact(paths, args.category, args.content);
-          await refreshDerivedFiles(paths);
-          await syncGlobalAgents(paths);
-          const state = await readPluginState(paths);
-          state.lastMaintenanceAt = nowIso();
-          state.lastMaintenanceMs = Date.now();
-          await writePluginState(paths, state);
-          const status = await collectStatus(paths);
+          const status = await runSerializedMaintenance(paths, async () => {
+            await ensureScaffold(paths, options, false);
+            await rememberProfileFact(paths, args.category, args.content);
+            const state = await readPluginState(paths);
+            await refreshDerivedFiles(paths, state);
+            await syncGlobalAgents(paths, state);
+            state.lastMaintenanceAt = nowIso();
+            state.lastMaintenanceMs = Date.now();
+            await writePluginState(paths, state);
+            return await collectStatus(paths);
+          });
           context.metadata({ title: "Stored Mercury memory", metadata: { category: args.category } });
           return JSON.stringify({
             category: args.category,
@@ -2131,7 +2505,16 @@ ${args.noteText.trim()}
           text: textFromParts(output.parts),
           directory: input.directory,
         },
-        { force: false, reason: "chat-message", allowKnowledgeSync: false, allowBackups: false },
+        {
+          force: false,
+          reason: "chat-message",
+          allowActivitySync: false,
+          allowKnowledgeSync: false,
+          allowDropboxIngest: false,
+          allowDerivedRefresh: false,
+          allowAgentSync: false,
+          allowBackups: false,
+        },
       );
     },
     "command.execute.before": async () => {
